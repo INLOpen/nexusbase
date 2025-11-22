@@ -29,12 +29,11 @@ jobs:
             echo "go_changes_detected=false" >> "$GITHUB_OUTPUT"
           fi
 
-    - name: Set up Go
-      if: steps.check_changes.outputs.go_changes_detected == 'true'
-      uses: actions/setup-go@v4
+    - name: Setup Golang with cache
+      uses: magnetikonline/action-golang-cache@v5
       with:
-        go-version: '1.23'
-  
+        go-version-file: go.mod
+
     - name: Install dependencies
       run: go mod download
 
@@ -68,11 +67,10 @@ jobs:
           echo "go_changes_detected=false" >> "$env:GITHUB_OUTPUT"
         }
 
-    - name: Set up Go
-      if: steps.check_changes.outputs.go_changes_detected == 'true'
-      uses: actions/setup-go@v4
+    - name: Setup Golang with cache
+      uses: magnetikonline/action-golang-cache@v5
       with:
-        go-version: '1.23'
+        go-version-file: go.mod
 
     - name: Install dependencies
       run: go mod download

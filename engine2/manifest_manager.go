@@ -11,7 +11,11 @@ import (
 // ManifestManager maintains an in-memory view of the SSTable manifest and
 // provides helpers to persist and query entries.
 type ManifestManager struct {
-	mu           sync.RWMutex
+	mu sync.RWMutex
+	// addMu serializes submissions to the background queue to reduce
+	// contention and make AddEntry behavior more predictable under
+	// extreme concurrent load.
+	addMu        sync.Mutex
 	entries      []SSTableManifestEntry
 	manifestPath string
 	// background queue for serializing manifest writes to disk. Entries are
@@ -69,16 +73,49 @@ func (m *ManifestManager) Reload() error {
 
 // AddEntry persists the new entry and updates the in-memory state.
 func (m *ManifestManager) AddEntry(e SSTableManifestEntry) error {
-	// Enqueue the entry and wait for the background writer to persist it.
+	// Serialize only the enqueue operation to avoid queue contention.
+	// Do NOT hold the lock while waiting on the background worker response,
+	// otherwise AddEntry callers will be serialized behind the full disk
+	// persist latency which causes severe bottlenecks under high load.
 	qe := queuedEntry{e: e, resp: make(chan error, 1)}
+	// Delegate enqueue/fallback logic to helper while serializing the
+	// submission operation with addMu to reduce contention.
+	if err := m.enqueueQueuedEntry(qe); err != nil {
+		return err
+	}
+	// wait for result without holding addMu
+	return <-qe.resp
+}
+
+// enqueueQueuedEntry centralizes the logic for submitting a queuedEntry to
+// the manager's internal queue. It tries a non-blocking send while holding
+// `addMu` and, if the queue is full, enqueues asynchronously so callers are
+// not blocked on queue backpressure. Returns an error if the manager is
+// shutting down.
+func (m *ManifestManager) enqueueQueuedEntry(qe queuedEntry) error {
+	m.addMu.Lock()
+
 	select {
 	case m.queue <- qe:
-		// submitted
+		m.addMu.Unlock()
+		return nil
 	case <-m.shutdownCh:
+		m.addMu.Unlock()
 		return fmt.Errorf("manifest manager shutting down")
+	default:
+		// Queue full: release lock and enqueue asynchronously so the caller
+		// doesn't block on a channel send.
+		m.addMu.Unlock()
+		go func(q queuedEntry) {
+			select {
+			case m.queue <- q:
+				// enqueued
+			case <-m.shutdownCh:
+				q.resp <- fmt.Errorf("manifest manager shutting down")
+			}
+		}(qe)
+		return nil
 	}
-	// wait for result
-	return <-qe.resp
 }
 
 // Close stops the background writer and waits for outstanding work to finish.
@@ -98,8 +135,11 @@ func (m *ManifestManager) Close() {
 // manifestWriter runs as a single background goroutine processing queued entries.
 func (m *ManifestManager) manifestWriter() {
 	defer m.workerClose.Done()
-	const maxBatch = 128
-	const batchWait = 2 * time.Millisecond
+	// Increase batch size and wait window to reduce the number of disk
+	// persist operations under high contention. This improves throughput by
+	// amortizing the cost of SaveManifest across more entries.
+	const maxBatch = 1024
+	const batchWait = 5 * time.Millisecond
 
 	for {
 		select {
@@ -121,16 +161,16 @@ func (m *ManifestManager) manifestWriter() {
 				}
 			}
 
-			// Perform read-modify-write persist for the entire batch.
-			diskManifest, err := LoadManifest(m.manifestPath)
-			if err != nil {
-				for _, be := range batch {
-					be.resp <- err
-				}
-				continue
-			}
-			newEntries := make([]SSTableManifestEntry, 0, len(diskManifest.Entries)+len(batch))
-			newEntries = append(newEntries, diskManifest.Entries...)
+			// Build the new entries list by snapshotting the current in-memory
+			// entries and appending the batch. This avoids re-loading the
+			// manifest from disk on every batch (which causes repeated re-writes
+			// of already persisted entries) and greatly improves throughput.
+			m.mu.RLock()
+			current := make([]SSTableManifestEntry, len(m.entries))
+			copy(current, m.entries)
+			m.mu.RUnlock()
+			newEntries := make([]SSTableManifestEntry, 0, len(current)+len(batch))
+			newEntries = append(newEntries, current...)
 			for _, be := range batch {
 				newEntries = append(newEntries, be.e)
 			}
