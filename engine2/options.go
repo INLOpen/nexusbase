@@ -82,6 +82,15 @@ type StorageEngineOptions struct {
 	// compatibility helpers. When present, the adapter will be created with
 	// this hook manager so callers can receive hook events.
 	HookManager hooks.HookManager
+
+	// TmpFileCleanupThresholdSeconds controls how old `.tmp` SSTable files
+	// must be (in seconds) before they are cleaned up at startup or by the
+	// periodic background cleaner. If zero, a default of 60 seconds is used.
+	TmpFileCleanupThresholdSeconds int
+
+	// TmpFileCleanupIntervalSeconds controls the periodic cleanup interval
+	// (in seconds). If zero, no periodic cleanup goroutine is started.
+	TmpFileCleanupIntervalSeconds int
 }
 
 // RoundingRule mirrors the helper type used by engine tests for relative

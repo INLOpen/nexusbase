@@ -1,42 +1,92 @@
 package sys
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 )
 
-func TestRename_FallbackCopyOnRenameFailure(t *testing.T) {
-	// create temp dir
-	dir := t.TempDir()
-	src := filepath.Join(dir, "srcfile.txt")
-	dst := filepath.Join(dir, "dstfile.txt")
-	// write source file
-	if err := os.WriteFile(src, []byte("hello"), 0644); err != nil {
-		t.Fatalf("failed to write src file: %v", err)
+// TestRenameFallback_CopyAndRemoveSuccess verifies that when the platform
+// rename fails, the fallback copy+remove path creates the destination and
+// removes the source when Remove succeeds.
+func TestRenameFallback_CopyAndRemoveSuccess(t *testing.T) {
+	// Save/restore renameImpl and Remove
+	origRename := GetRenameImpl()
+	defer SetRenameImpl(origRename)
+	origRemove := Remove
+	defer func() { Remove = origRemove }()
+
+	// Force rename to fail so copy fallback is exercised
+	SetRenameImpl(func(oldpath, newpath string) error {
+		return errors.New("simulated rename failure")
+	})
+
+	// Use default Remove behavior (do not override) so retry logic can run
+
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src.txt")
+	dst := filepath.Join(tmp, "dst.txt")
+
+	if err := os.WriteFile(src, []byte("hello"), 0o644); err != nil {
+		t.Fatalf("write src: %v", err)
 	}
 
-	// override renameImpl to always fail, to force fallback path
-	old := renameImpl
-	renameImpl = func(old, new string) error {
-		return os.ErrPermission
-	}
-	defer func() { renameImpl = old }()
-
-	err := Rename(src, dst)
-	// On some platforms (Windows) the source file may still be held open by
-	// the runtime or antivirus, causing the final removal to fail even though
-	// the copy occurred. Accept either a nil error or an error but ensure the
-	// destination was created by the fallback copy.
-	if err != nil {
-		t.Logf("Rename returned error (acceptable on this platform): %v", err)
+	if err := Rename(src, dst); err != nil {
+		t.Fatalf("Rename returned error: %v", err)
 	}
 
-	// dst should exist and contain the same data
-	if _, statErr := os.Stat(dst); statErr != nil {
-		t.Fatalf("expected dst to exist, got err: %v", statErr)
+	// Destination should exist and contain data
+	if _, err := os.Stat(dst); err != nil {
+		t.Fatalf("expected destination to exist: %v", err)
+	}
+	// Source should have been removed by Remove
+	if _, err := os.Stat(src); !os.IsNotExist(err) {
+		t.Fatalf("expected source to be removed, stat err: %v", err)
+	}
+}
+
+// TestRenameFallback_RemoveFailsNonFatal verifies that when the fallback
+// successfully copies but Remove fails (persistent sharing violation), the
+// function treats removal as non-fatal and returns success while leaving the
+// source file behind for later cleanup.
+func TestRenameFallback_RemoveFailsNonFatal(t *testing.T) {
+	origRename := GetRenameImpl()
+	defer SetRenameImpl(origRename)
+	origRemove := Remove
+	defer func() { Remove = origRemove }()
+
+	SetRenameImpl(func(oldpath, newpath string) error {
+		return errors.New("simulated rename failure")
+	})
+
+	// Simulate persistent Remove failure (e.g., sharing violation). This
+	// will exercise the non-fatal path introduced for Windows.
+	Remove = func(name string) error {
+		return errors.New("simulated remove failure")
 	}
 
-	// Attempt best-effort cleanup of src; ignore errors during cleanup.
-	_ = os.Remove(src)
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src2.txt")
+	dst := filepath.Join(tmp, "dst2.txt")
+
+	if err := os.WriteFile(src, []byte("world"), 0o644); err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+
+	// Should return nil (non-fatal) even though Remove failed
+	if err := Rename(src, dst); err != nil {
+		t.Fatalf("Rename returned error (should be non-fatal on remove fail): %v", err)
+	}
+
+	// Destination must exist (copy succeeded)
+	if _, err := os.Stat(dst); err != nil {
+		t.Fatalf("expected destination to exist: %v", err)
+	}
+
+	// Source may remain due to simulated persistent remove failure
+	if _, err := os.Stat(src); err != nil && !os.IsNotExist(err) {
+		// If Stat returned non-notexist error that's unexpected
+		t.Fatalf("unexpected stat error for source: %v", err)
+	}
 }

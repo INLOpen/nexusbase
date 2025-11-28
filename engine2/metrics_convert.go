@@ -72,7 +72,7 @@ type EngineMetricsLegacy struct {
 // `EngineMetricsLegacy` instance. This copies pointer references so the
 // returned struct shares expvar variables (intended for tooling/interop
 // without importing the legacy package).
-func (m *EngineMetrics2) ToEngine() *EngineMetricsLegacy {
+func (m *EngineMetrics) ToEngine() *EngineMetricsLegacy {
 	if m == nil {
 		return nil
 	}
@@ -140,11 +140,11 @@ func (m *EngineMetrics2) ToEngine() *EngineMetricsLegacy {
 
 // FromEngine builds an EngineMetrics2 from a legacy-compatible
 // `EngineMetricsLegacy` instance.
-func FromEngine(e *EngineMetricsLegacy) *EngineMetrics2 {
+func FromEngine(e *EngineMetricsLegacy) *EngineMetrics {
 	if e == nil {
 		return nil
 	}
-	return &EngineMetrics2{
+	return &EngineMetrics{
 		PublishedGlobally:     e.PublishedGlobally,
 		PutTotal:              e.PutTotal,
 		PutErrorsTotal:        e.PutErrorsTotal,

@@ -9,6 +9,7 @@ import (
 	"expvar"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"math"
 	"os"
@@ -106,6 +107,12 @@ type Engine2Adapter struct {
 	rangeTombstones   map[string][]core.RangeTombstone
 	rangeTombstonesMu sync.RWMutex
 
+	// persistNextSSTableEvery controls how often the adapter persists the
+	// `next_sstable_id` to disk. A value of 1 persists on every allocation.
+	// Larger values reduce IO at the cost of a larger allocation window that
+	// may be lost on crash. Default set in constructor.
+	persistNextSSTableEvery uint64
+
 	// indicates startup used fallback scan (manifest missing/empty)
 	fallbackScanned atomic.Bool
 
@@ -137,7 +144,7 @@ func NewEngine2Adapter(e *Engine2) *Engine2Adapter {
 func NewEngine2AdapterWithHooks(e *Engine2, hm hooks.HookManager) *Engine2Adapter {
 	a := &Engine2Adapter{
 		Engine2:       e,
-		nextSSTableID: uint64(time.Now().UnixNano()),
+		nextSSTableID: 0,
 		adapterID:     uint64(time.Now().UnixNano()),
 		stringStore:   indexer.NewStringStore(slog.Default(), hm),
 		hookManager:   hm,
@@ -182,13 +189,149 @@ func NewEngine2AdapterWithHooks(e *Engine2, hm hooks.HookManager) *Engine2Adapte
 			a.tagIndexManager = tim
 		}
 	}
+
+	// best-effort cleanup of stale temporary sstable files created by
+	// previous runs. Use configured threshold/interval when available.
+	if e != nil {
+		// threshold default 60s
+		threshold := 60 * time.Second
+		if e.options.TmpFileCleanupThresholdSeconds > 0 {
+			threshold = time.Duration(e.options.TmpFileCleanupThresholdSeconds) * time.Second
+		}
+
+		if removed, err := sys.CleanupOldTmpFiles(e.GetDataRoot(), threshold); err == nil {
+			slog.Default().Info("Cleaned stale sstable .tmp files", "removed", removed)
+		} else {
+			slog.Default().Debug("Failed cleaning stale sstable .tmp files", "error", err)
+		}
+
+		// Start periodic cleaner if configured
+		if e.options.TmpFileCleanupIntervalSeconds > 0 {
+			go func(dataDir string, th time.Duration, iv time.Duration) {
+				ticker := time.NewTicker(iv)
+				defer ticker.Stop()
+				for range ticker.C {
+					if removed, err := sys.CleanupOldTmpFiles(dataDir, th); err == nil {
+						slog.Default().Debug("Periodic cleanup removed stale sstable .tmp files", "removed", removed)
+					} else {
+						slog.Default().Debug("Periodic cleanup failed", "error", err)
+					}
+				}
+			}(e.GetDataRoot(), threshold, time.Duration(e.options.TmpFileCleanupIntervalSeconds)*time.Second)
+		}
+	}
+
+	// seed id allocator. Prefer persisted value; otherwise scan sstables dir for max ID
+	// and use max(maxID+1, now).
+	nowID := uint64(time.Now().UnixNano())
+	var initial uint64 = nowID
+	if a.GetDataDir() != "" {
+		if v, err := loadPersistedNextSSTableID(a.GetDataDir()); err == nil && v > 0 {
+			initial = v
+		} else if maxID, err := scanMaxSSTableID(a.GetDataDir()); err == nil && maxID+1 > initial {
+			initial = maxID + 1
+		}
+		// persist initial value so future restarts start from here
+		_ = persistNextSSTableID(a.GetDataDir(), initial)
+	}
+	atomic.StoreUint64(&a.nextSSTableID, initial)
+
 	// initialize metrics instance once, shared by tests and adapter
 	a.metrics = NewEngineMetrics(false, "")
+
+	// set default persist frequency (persist every N allocations)
+	a.persistNextSSTableEvery = 64
 	return a
 }
 
 func (a *Engine2Adapter) GetNextSSTableID() uint64 {
-	return atomic.AddUint64(&a.nextSSTableID, 1)
+	val := atomic.AddUint64(&a.nextSSTableID, 1)
+	if a.GetDataDir() == "" {
+		return val
+	}
+
+	// Determine persistence frequency. If persistNextSSTableEvery is 0,
+	// fallback to a reasonable default of 64.
+	persistEvery := a.persistNextSSTableEvery
+	if persistEvery == 0 {
+		persistEvery = 64
+	}
+
+	// Persist only on boundaries to reduce IO (batching). This means that
+	// up to `persistEvery-1` allocated IDs may be lost on a crash.
+	if val%persistEvery == 0 {
+		_ = persistNextSSTableID(a.GetDataDir(), val)
+	}
+	return val
+}
+
+// persisted file path for next sstable id
+func persistedNextIDPath(dataDir string) string {
+	return filepath.Join(dataDir, "sstables", "next_sstable_id")
+}
+
+func loadPersistedNextSSTableID(dataDir string) (uint64, error) {
+	path := persistedNextIDPath(dataDir)
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	s := strings.TrimSpace(string(b))
+	if s == "" {
+		return 0, fmt.Errorf("empty persisted next id")
+	}
+	v, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return v, nil
+}
+
+func persistNextSSTableID(dataDir string, v uint64) error {
+	path := persistedNextIDPath(dataDir)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(strconv.FormatUint(v, 10)), 0o644); err != nil {
+		return err
+	}
+	// try sys.Rename (handles cross-device), then fallback to os.Rename
+	if err := sys.Rename(tmp, path); err != nil {
+		if err2 := os.Rename(tmp, path); err2 != nil {
+			return fmt.Errorf("rename failed: %v (fallback: %v)", err, err2)
+		}
+	}
+	return nil
+}
+
+// scanMaxSSTableID scans `sstables` and `sst` directories under dataDir and returns the maximum numeric SSTable id found.
+func scanMaxSSTableID(dataDir string) (uint64, error) {
+	var max uint64
+	found := false
+	dirs := []string{filepath.Join(dataDir, "sstables"), filepath.Join(dataDir, "sst")}
+	for _, d := range dirs {
+		_ = filepath.WalkDir(d, func(path string, de fs.DirEntry, err error) error {
+			if err != nil || de.IsDir() {
+				return nil
+			}
+			name := de.Name()
+			if strings.HasSuffix(name, ".sst") {
+				idStr := strings.TrimSuffix(name, ".sst")
+				if id, err := strconv.ParseUint(idStr, 10, 64); err == nil {
+					if !found || id > max {
+						max = id
+						found = true
+					}
+				}
+			}
+			return nil
+		})
+	}
+	if !found {
+		return 0, nil
+	}
+	return max, nil
 }
 
 // Data Manipulation
@@ -2481,7 +2624,7 @@ func (a *Engine2Adapter) Start() error {
 	}
 	// Create/open leader WAL (wal package) for replication/snapshot features
 	if a.leaderWal == nil && a.Engine2 != nil {
-		lw, err := openLeaderWAL(a.Engine2.GetDataRoot())
+		lw, err := openLeaderWAL(a.Engine2.GetDataRoot(), a.metrics)
 		if err != nil {
 			return err
 		}
