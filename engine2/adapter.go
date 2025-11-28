@@ -113,6 +113,14 @@ type Engine2Adapter struct {
 	// may be lost on crash. Default set in constructor.
 	persistNextSSTableEvery uint64
 
+	// cleanupCancel is a cancel func for the periodic tmp-file cleanup
+	// goroutine. When non-nil, Close() will call it and wait for the
+	// goroutine to exit via cleanupWg.
+	cleanupCancel context.CancelFunc
+	// cleanupWg tracks the periodic cleaner goroutine so Close() can wait
+	// for it to exit before returning.
+	cleanupWg sync.WaitGroup
+
 	// indicates startup used fallback scan (manifest missing/empty)
 	fallbackScanned atomic.Bool
 
@@ -205,19 +213,31 @@ func NewEngine2AdapterWithHooks(e *Engine2, hm hooks.HookManager) *Engine2Adapte
 			slog.Default().Debug("Failed cleaning stale sstable .tmp files", "error", err)
 		}
 
-		// Start periodic cleaner if configured
+		// Start periodic cleaner if configured. Use a cancellable context so
+		// the adapter can stop the goroutine during Close(). Track the
+		// goroutine with cleanupWg so Close() can wait for it to finish.
 		if e.options.TmpFileCleanupIntervalSeconds > 0 {
-			go func(dataDir string, th time.Duration, iv time.Duration) {
+			ctx, cancel := context.WithCancel(e.GetContext())
+			a.cleanupCancel = cancel
+			a.cleanupWg.Add(1)
+			go func(dataDir string, th time.Duration, iv time.Duration, ctx context.Context) {
+				defer a.cleanupWg.Done()
 				ticker := time.NewTicker(iv)
 				defer ticker.Stop()
-				for range ticker.C {
-					if removed, err := sys.CleanupOldTmpFiles(dataDir, th); err == nil {
-						slog.Default().Debug("Periodic cleanup removed stale sstable .tmp files", "removed", removed)
-					} else {
-						slog.Default().Debug("Periodic cleanup failed", "error", err)
+				for {
+					select {
+					case <-ticker.C:
+						if removed, err := sys.CleanupOldTmpFiles(dataDir, th); err == nil {
+							slog.Default().Debug("Periodic cleanup removed stale sstable .tmp files", "removed", removed)
+						} else {
+							slog.Default().Debug("Periodic cleanup failed", "error", err)
+						}
+					case <-ctx.Done():
+						slog.Default().Debug("Periodic tmp-file cleaner stopping")
+						return
 					}
 				}
-			}(e.GetDataRoot(), threshold, time.Duration(e.options.TmpFileCleanupIntervalSeconds)*time.Second)
+			}(e.GetDataRoot(), threshold, time.Duration(e.options.TmpFileCleanupIntervalSeconds)*time.Second, ctx)
 		}
 	}
 
@@ -2924,6 +2944,11 @@ func (a *Engine2Adapter) Close() error {
 		_ = a.ForceFlush(context.Background(), true)
 	}
 
+	// Cancel engine-level context so any derived contexts stop promptly.
+	if a.Engine2 != nil {
+		_ = a.Engine2.Close()
+	}
+
 	if a.wal != nil {
 		if err := a.wal.Close(); err != nil {
 			return err
@@ -2958,6 +2983,14 @@ func (a *Engine2Adapter) Close() error {
 		a.compactionMgr.Stop()
 		// wait for background compaction loop to exit if Start() added to wg
 		a.compactionWg.Wait()
+	}
+
+	// signal periodic tmp-file cleaner to stop if it was started
+	if a.cleanupCancel != nil {
+		// request cancellation and wait for the goroutine to exit
+		a.cleanupCancel()
+		a.cleanupWg.Wait()
+		a.cleanupCancel = nil
 	}
 
 	// reset sequence number

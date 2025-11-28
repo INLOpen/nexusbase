@@ -1,6 +1,7 @@
 package engine2
 
 import (
+	"context"
 	"log/slog"
 	"testing"
 
@@ -21,7 +22,7 @@ func NewStorageEngine(opts StorageEngineOptions) (StorageEngineInterface, error)
 	// Construct an engine2-backed storage engine and adapt it to the
 	// repository StorageEngineInterface so callers get an engine2-backed
 	// StorageEngine with minimal changes to their callsites.
-	e, err := NewEngine2(opts)
+	e, err := NewEngine2(context.Background(), opts)
 	if err != nil {
 		return nil, err
 	}

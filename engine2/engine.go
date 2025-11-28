@@ -25,14 +25,26 @@ var (
 
 // Engine2 is a minimal engine implementation that manages per-database filesystem layout.
 type Engine2 struct {
+	ctx     context.Context
+	cancel  context.CancelFunc
 	options StorageEngineOptions
 	mu      sync.Mutex
 	wal     *WAL
 	mem     *memtable.Memtable2
 }
 
-// NewEngine2 constructs a new Engine2 rooted at dataRoot.
-func NewEngine2(opts StorageEngineOptions) (*Engine2, error) {
+// NewEngine2 constructs a new Engine2 rooted at dataRoot. The provided
+// parent context is stored on the engine and used by consumers (adapters)
+// as a parent for background goroutines. If ctx is nil, context.Background()
+// is used to preserve previous behavior.
+func NewEngine2(ctx context.Context, opts StorageEngineOptions) (*Engine2, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// derive a cancellable context owned by the engine so callers can
+	// request engine-level shutdown which will cancel contexts derived
+	// from this parent.
+	ctx, cancel := context.WithCancel(ctx)
 	options := opts // copy
 	dataRoot := opts.DataDir
 	if dataRoot == "" {
@@ -68,8 +80,32 @@ func NewEngine2(opts StorageEngineOptions) (*Engine2, error) {
 		return nil, fmt.Errorf("failed to replay WAL: %w", err)
 	}
 
-	return &Engine2{options: options, wal: w, mem: m}, nil
+	return &Engine2{ctx: ctx, cancel: cancel, options: options, wal: w, mem: m}, nil
 }
+
+// GetContext returns the engine-level context that was provided at
+// construction. Callers may derive cancellable contexts from this as
+// needed for background work tied to the engine lifecycle.
+func (e *Engine2) GetContext() context.Context { return e.ctx }
+
+// Close cancels the engine-level context, signalling background
+// goroutines that derived contexts should stop. Close is safe to call
+// multiple times.
+func (e *Engine2) Close() error {
+	if e == nil {
+		return nil
+	}
+	if e.cancel != nil {
+		e.cancel()
+		// clear the cancel to indicate we've closed
+		e.cancel = nil
+	}
+	return nil
+}
+
+// Shutdown is an alias for Close and provided for callers that prefer
+// an explicit shutdown-style name.
+func (e *Engine2) Shutdown() error { return e.Close() }
 
 func (e *Engine2) GetDataRoot() string { return e.options.DataDir }
 
