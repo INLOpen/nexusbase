@@ -244,7 +244,7 @@
         };
 
 
-        const ingestionRateChart = createChart(document.getElementById('ingestionRateChart').getContext('2d'), 'Ingestion Rate (points/sec)', [
+        const ingestionRateChart = createChart(document.getElementById('ingestionRateChart').getContext('2d'), 'Ingestion Rate (points/sec) / Success (%)', [
             {
                 label: 'Points / Second',
                 data: chartData.ingestionRate,
@@ -397,7 +397,17 @@
             chartData.memtableSize.push(data['engine_mutable_memtable_size_bytes'] || 0);
             chartData.immutableCount.push(data['engine_immutable_memtables_count'] || 0);
             chartData.goHeapAlloc.push(data['memstats']['Alloc'] || 0);
-            chartData.ingestionRate.push(data['engine_ingestion_rate_points_per_second'] || 0);
+            // Ingestion metric: prefer direct points/sec if available, otherwise
+            // fall back to the derived `ingestion_ratio` (0..1) and present it
+            // as a percentage for the same chart.
+            let ingestionVal = 0;
+            if (data['engine_ingestion_rate_points_per_second'] !== undefined && data['engine_ingestion_rate_points_per_second'] !== null) {
+                ingestionVal = data['engine_ingestion_rate_points_per_second'];
+            } else if (data['ingestion_ratio'] !== undefined && data['ingestion_ratio'] !== null) {
+                // convert ratio [0..1] to percentage for display
+                ingestionVal = data['ingestion_ratio'] * 100;
+            }
+            chartData.ingestionRate.push(ingestionVal || 0);
             chartData.cpuUsage.push(data['system_cpu_usage_percent'] || 0);
             chartData.memoryUsage.push(data['system_mem_usage_percent'] || 0);
             chartData.diskUsage.push(data['system_disk_usage_percent'] || 0);

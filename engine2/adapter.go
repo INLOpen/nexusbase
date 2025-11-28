@@ -189,6 +189,20 @@ func NewEngine2AdapterWithHooks(e *Engine2, hm hooks.HookManager) *Engine2Adapte
 			SSTNextID:       a.GetNextSSTableID,
 		}
 		timOpts := indexer.TagIndexManagerOptions{DataDir: e.GetDataRoot()}
+		// propagate index-related options from engine options
+		// (assign directly; zero-values will be handled by TagIndexManager defaults)
+		timOpts.MemtableThreshold = e.options.IndexMemtableThreshold
+		timOpts.FlushIntervalMs = e.options.IndexFlushIntervalMs
+		timOpts.CompactionIntervalSeconds = e.options.IndexCompactionIntervalSeconds
+		timOpts.MaxL0Files = e.options.IndexMaxL0Files
+		timOpts.BaseTargetSize = e.options.IndexBaseTargetSize
+
+		// Map compaction tuning parameters
+		timOpts.LevelsTargetSizeMultiplier = e.options.LevelsTargetSizeMultiplier
+		timOpts.L0CompactionTriggerSize = e.options.L0CompactionTriggerSize
+		timOpts.MaxLevels = e.options.MaxLevels
+		timOpts.CompactionTombstoneWeight = e.options.CompactionTombstoneWeight
+		timOpts.CompactionOverlapWeight = e.options.CompactionOverlapWeight
 		// propagate sstable writer tuning options to the tag index manager
 		timOpts.EnableSSTablePreallocate = e.options.EnableSSTablePreallocate
 		timOpts.SSTableRestartPointInterval = e.options.SSTableRestartPointInterval
@@ -258,6 +272,16 @@ func NewEngine2AdapterWithHooks(e *Engine2, hm hooks.HookManager) *Engine2Adapte
 
 	// initialize metrics instance once, shared by tests and adapter
 	a.metrics = NewEngineMetrics(false, "")
+
+	// Register bloom filter hooks so sstable package can signal checks/false-positives
+	// to the adapter metrics. Use best-effort: only register when metrics present.
+	if a.metrics != nil {
+		sstable.SetBloomFilterHooks(func() {
+			a.metrics.BloomFilterChecksTotal.Add(1)
+		}, func() {
+			a.metrics.BloomFilterFalsePositivesTotal.Add(1)
+		})
+	}
 
 	// set default persist frequency (persist every N allocations)
 	a.persistNextSSTableEvery = 64
@@ -356,6 +380,13 @@ func scanMaxSSTableID(dataDir string) (uint64, error) {
 
 // Data Manipulation
 func (a *Engine2Adapter) Put(ctx context.Context, point core.DataPoint) error {
+	start := time.Now()
+	defer func() {
+		if a != nil && a.metrics != nil && a.metrics.PutLatencyHist != nil {
+			observeLatency(a.metrics.PutLatencyHist, time.Since(start).Seconds())
+		}
+	}()
+
 	if a.wal == nil || a.mem == nil {
 		return fmt.Errorf("engine2 not initialized")
 	}
@@ -369,7 +400,14 @@ func (a *Engine2Adapter) Put(ctx context.Context, point core.DataPoint) error {
 	}
 
 	if err := a.wal.Append(&point); err != nil {
+		if a.metrics != nil {
+			a.metrics.PutErrorsTotal.Add(1)
+			a.metrics.RecomputeIngestionRatio()
+		}
 		return fmt.Errorf("wal append failed: %w", err)
+	}
+	if a.metrics != nil {
+		a.metrics.WALEntriesWrittenTotal.Add(1)
 	}
 
 	// Prefer ID-encoded WALEntry when possible (more efficient).
@@ -415,6 +453,10 @@ func (a *Engine2Adapter) Put(ctx context.Context, point core.DataPoint) error {
 			ps.Publish(upd)
 		}
 
+		if a.metrics != nil {
+			a.metrics.PutTotal.Add(1)
+			a.metrics.RecomputeIngestionRatio()
+		}
 		return nil
 	}
 
@@ -430,6 +472,10 @@ func (a *Engine2Adapter) Put(ctx context.Context, point core.DataPoint) error {
 	} else {
 		vb, e := point.Fields.Encode()
 		if e != nil {
+			if a.metrics != nil {
+				a.metrics.PutErrorsTotal.Add(1)
+				a.metrics.RecomputeIngestionRatio()
+			}
 			return fmt.Errorf("failed to encode fields: %w", e)
 		}
 		seq := a.sequenceNumber.Add(1)
@@ -469,6 +515,10 @@ func (a *Engine2Adapter) Put(ctx context.Context, point core.DataPoint) error {
 		}
 	}
 
+	if a.metrics != nil {
+		a.metrics.PutTotal.Add(1)
+		a.metrics.RecomputeIngestionRatio()
+	}
 	return nil
 }
 
@@ -485,8 +535,17 @@ func (a *Engine2Adapter) PutBatch(ctx context.Context, points []core.DataPoint) 
 }
 
 func (a *Engine2Adapter) Get(ctx context.Context, metric string, tags map[string]string, timestamp int64) (core.FieldValues, error) {
+	start := time.Now()
+	defer func() {
+		if a != nil && a.metrics != nil && a.metrics.GetLatencyHist != nil {
+			observeLatency(a.metrics.GetLatencyHist, time.Since(start).Seconds())
+		}
+	}()
 	if a.mem == nil {
 		return nil, fmt.Errorf("engine2 not initialized")
+	}
+	if a.metrics != nil {
+		a.metrics.GetTotal.Add(1)
 	}
 	// First try id-encoded key when a.stringStore is available (this matches Put when IDs were used)
 	if a.stringStore != nil {
@@ -563,6 +622,12 @@ func (a *Engine2Adapter) Get(ctx context.Context, metric string, tags map[string
 	return nil, sstable.ErrNotFound
 }
 func (a *Engine2Adapter) Delete(ctx context.Context, metric string, tags map[string]string, timestamp int64) error {
+	start := time.Now()
+	defer func() {
+		if a != nil && a.metrics != nil && a.metrics.DeleteLatencyHist != nil {
+			observeLatency(a.metrics.DeleteLatencyHist, time.Since(start).Seconds())
+		}
+	}()
 	if a.wal == nil || a.mem == nil {
 		return fmt.Errorf("engine2 not initialized")
 	}
@@ -570,6 +635,10 @@ func (a *Engine2Adapter) Delete(ctx context.Context, metric string, tags map[str
 	dp := core.DataPoint{Metric: metric, Tags: tags, Timestamp: timestamp, Fields: nil}
 	if err := a.wal.Append(&dp); err != nil {
 		return fmt.Errorf("wal append failed: %w", err)
+	}
+	if a.metrics != nil {
+		a.metrics.DeleteTotal.Add(1)
+		a.metrics.WALEntriesWrittenTotal.Add(1)
 	}
 	// Represent delete as memtable tombstone put
 	if entry, err := a.encodeDataPointToWALEntry(&dp); err == nil {
@@ -593,6 +662,12 @@ func (a *Engine2Adapter) Delete(ctx context.Context, metric string, tags map[str
 	return nil
 }
 func (a *Engine2Adapter) DeleteSeries(ctx context.Context, metric string, tags map[string]string) error {
+	start := time.Now()
+	defer func() {
+		if a != nil && a.metrics != nil && a.metrics.DeleteLatencyHist != nil {
+			observeLatency(a.metrics.DeleteLatencyHist, time.Since(start).Seconds())
+		}
+	}()
 	if a.wal == nil || a.mem == nil {
 		return fmt.Errorf("engine2 not initialized")
 	}
@@ -600,6 +675,10 @@ func (a *Engine2Adapter) DeleteSeries(ctx context.Context, metric string, tags m
 	dp := core.DataPoint{Metric: metric, Tags: tags, Timestamp: -1, Fields: nil}
 	if err := a.wal.Append(&dp); err != nil {
 		return fmt.Errorf("wal append failed: %w", err)
+	}
+	if a.metrics != nil {
+		a.metrics.DeleteTotal.Add(1)
+		a.metrics.WALEntriesWrittenTotal.Add(1)
 	}
 	// Use a single tombstone key for timestamp -1 to mark series deletion
 	if entry, err := a.encodeDataPointToWALEntry(&dp); err == nil {
@@ -721,8 +800,15 @@ func (a *Engine2Adapter) DeletesByTimeRange(ctx context.Context, metric string, 
 
 // Querying
 func (a *Engine2Adapter) Query(ctx context.Context, params core.QueryParams) (core.QueryResultIteratorInterface, error) {
+	metrics, _ := a.Metrics()
 	if a.mem == nil {
+		if metrics != nil && metrics.QueryErrorsTotal != nil {
+			metrics.QueryErrorsTotal.Add(1)
+		}
 		return nil, fmt.Errorf("engine2 not initialized")
+	}
+	if metrics != nil && metrics.QueryTotal != nil {
+		metrics.QueryTotal.Add(1)
 	}
 
 	// Note: validation of metric/tags is intentionally lightweight here.
@@ -833,6 +919,9 @@ func (a *Engine2Adapter) Query(ctx context.Context, params core.QueryParams) (co
 	}
 	binarySeriesKeys, err := getBinarySeriesKeys()
 	if err != nil {
+		if metrics != nil && metrics.QueryErrorsTotal != nil {
+			metrics.QueryErrorsTotal.Add(1)
+		}
 		return nil, fmt.Errorf("failed to find matching series: %w", err)
 	}
 	if len(binarySeriesKeys) == 0 {
@@ -928,6 +1017,9 @@ func (a *Engine2Adapter) Query(ctx context.Context, params core.QueryParams) (co
 			for _, it := range iteratorsToMerge {
 				it.Close()
 			}
+			if metrics != nil && metrics.QueryErrorsTotal != nil {
+				metrics.QueryErrorsTotal.Add(1)
+			}
 			return nil, fmt.Errorf("failed to build range iterators: %w", err)
 		}
 		iteratorsToMerge = append(iteratorsToMerge, rIters...)
@@ -946,6 +1038,9 @@ func (a *Engine2Adapter) Query(ctx context.Context, params core.QueryParams) (co
 		for _, it := range iteratorsToMerge {
 			it.Close()
 		}
+		if metrics != nil && metrics.QueryErrorsTotal != nil {
+			metrics.QueryErrorsTotal.Add(1)
+		}
 		return nil, fmt.Errorf("failed to merge iterators: %w", err)
 	}
 
@@ -960,6 +1055,9 @@ func (a *Engine2Adapter) Query(ctx context.Context, params core.QueryParams) (co
 			aggIter, aerr := iterator.NewMultiFieldAggregatingIterator(baseIter, params.AggregationSpecs, syntheticQueryStartKey)
 			if aerr != nil {
 				baseIter.Close()
+				if metrics != nil && metrics.QueryErrorsTotal != nil {
+					metrics.QueryErrorsTotal.Add(1)
+				}
 				return nil, fmt.Errorf("failed to create aggregating iterator: %w", aerr)
 			}
 			effective = aggIter
@@ -968,11 +1066,17 @@ func (a *Engine2Adapter) Query(ctx context.Context, params core.QueryParams) (co
 			iv, derr := time.ParseDuration(params.DownsampleInterval)
 			if derr != nil {
 				baseIter.Close()
+				if metrics != nil && metrics.QueryErrorsTotal != nil {
+					metrics.QueryErrorsTotal.Add(1)
+				}
 				return nil, fmt.Errorf("invalid downsample interval: %w", derr)
 			}
 			dsi, derr2 := iterator.NewMultiFieldDownsamplingIterator(baseIter, params.AggregationSpecs, iv, params.StartTime, params.EndTime, params.EmitEmptyWindows)
 			if derr2 != nil {
 				baseIter.Close()
+				if metrics != nil && metrics.QueryErrorsTotal != nil {
+					metrics.QueryErrorsTotal.Add(1)
+				}
 				return nil, fmt.Errorf("failed to create downsampling iterator: %w", derr2)
 			}
 			effective = dsi
@@ -1064,19 +1168,39 @@ func (it *engine2QueryResultIterator) Put(item *core.QueryResultItem) {
 func (it *engine2QueryResultIterator) At() (*core.QueryResultItem, error) {
 	cur, err := it.underlying.At()
 	if err != nil {
+		if it.engine != nil {
+			if metrics, merr := it.engine.Metrics(); merr == nil && metrics != nil && metrics.QueryErrorsTotal != nil {
+				metrics.QueryErrorsTotal.Add(1)
+			}
+		}
 		return nil, err
 	}
 	key, value := cur.Key, cur.Value
 	if len(key) < 8 {
+		if it.engine != nil {
+			if metrics, merr := it.engine.Metrics(); merr == nil && metrics != nil && metrics.QueryErrorsTotal != nil {
+				metrics.QueryErrorsTotal.Add(1)
+			}
+		}
 		return nil, fmt.Errorf("invalid key length in iterator: %d", len(key))
 	}
 	seriesKeyBytes := key[:len(key)-8]
 	metricID, encodedTags, err := core.DecodeSeriesKey(seriesKeyBytes)
 	if err != nil {
+		if it.engine != nil {
+			if metrics, merr := it.engine.Metrics(); merr == nil && metrics != nil && metrics.QueryErrorsTotal != nil {
+				metrics.QueryErrorsTotal.Add(1)
+			}
+		}
 		return nil, fmt.Errorf("failed to decode series key from iterator key: %w", err)
 	}
 	metric, ok := it.engine.stringStore.GetString(metricID)
 	if !ok {
+		if it.engine != nil {
+			if metrics, merr := it.engine.Metrics(); merr == nil && metrics != nil && metrics.QueryErrorsTotal != nil {
+				metrics.QueryErrorsTotal.Add(1)
+			}
+		}
 		return nil, fmt.Errorf("metric ID %d not found in string store", metricID)
 	}
 	// Temporary iterator-side diagnostic to help capture iterator view of
@@ -1106,6 +1230,11 @@ func (it *engine2QueryResultIterator) At() (*core.QueryResultItem, error) {
 	if it.isFinalAgg {
 		aggValues, err := core.DecodeAggregationResult(value)
 		if err != nil {
+			if it.engine != nil {
+				if metrics, merr := it.engine.Metrics(); merr == nil && metrics != nil && metrics.QueryErrorsTotal != nil {
+					metrics.QueryErrorsTotal.Add(1)
+				}
+			}
 			return nil, fmt.Errorf("failed to decode final aggregation result: %w", err)
 		}
 		result.IsAggregated = true
@@ -1141,6 +1270,11 @@ func (it *engine2QueryResultIterator) At() (*core.QueryResultItem, error) {
 	if cur.EntryType == core.EntryTypePutEvent && len(value) > 0 {
 		fv, derr := core.DecodeFieldsFromBytes(value)
 		if derr != nil {
+			if it.engine != nil {
+				if metrics, merr := it.engine.Metrics(); merr == nil && metrics != nil && metrics.QueryErrorsTotal != nil {
+					metrics.QueryErrorsTotal.Add(1)
+				}
+			}
 			return nil, derr
 		}
 		result.Fields = fv
@@ -1571,6 +1705,9 @@ func (a *Engine2Adapter) ApplyReplicatedEntry(ctx context.Context, entry *pb.WAL
 		}
 		fv, err := core.NewFieldValuesFromMap(fieldsMap)
 		if err != nil {
+			if a.metrics != nil {
+				a.metrics.ReplicationErrorsTotal.Add(1)
+			}
 			return fmt.Errorf("failed to decode replicated fields: %w", err)
 		}
 
@@ -1639,6 +1776,9 @@ func (a *Engine2Adapter) ApplyReplicatedEntry(ctx context.Context, entry *pb.WAL
 			if a.seriesIDStore != nil {
 				sid, err := a.seriesIDStore.GetOrCreateID(seriesKeyStr)
 				if err != nil {
+					if a.metrics != nil {
+						a.metrics.ReplicationErrorsTotal.Add(1)
+					}
 					return fmt.Errorf("failed to persist series id for replicated entry: %w", err)
 				}
 				if a.tagIndexManager != nil {
@@ -1657,6 +1797,9 @@ func (a *Engine2Adapter) ApplyReplicatedEntry(ctx context.Context, entry *pb.WAL
 			} else {
 				_ = a.mem.PutRaw(we.Key, we.Value, core.EntryTypePutEvent, seqNum)
 			}
+			if a.metrics != nil {
+				a.metrics.ReplicationPutTotal.Add(1)
+			}
 		} else {
 			// Fallback to string-key encoding when WALEntry encoding isn't available.
 			key := core.EncodeTSDBKeyWithString(dp.Metric, dp.Tags, dp.Timestamp)
@@ -1666,6 +1809,10 @@ func (a *Engine2Adapter) ApplyReplicatedEntry(ctx context.Context, entry *pb.WAL
 				vb, _ := dp.Fields.Encode()
 				_ = a.mem.PutRaw(key, vb, core.EntryTypePutEvent, seqNum)
 			}
+		}
+		// increment replication delete-series metric when applicable
+		if a.metrics != nil {
+			a.metrics.ReplicationDeleteSeriesTotal.Add(1)
 		}
 
 	case pb.WALEntry_DELETE_SERIES:
@@ -1757,6 +1904,10 @@ func (a *Engine2Adapter) ApplyReplicatedEntry(ctx context.Context, entry *pb.WAL
 				key := core.EncodeTSDBKeyWithString(entry.GetMetric(), entry.GetTags(), entry.GetStartTime())
 				_ = a.mem.PutRaw(key, nil, core.EntryTypeDelete, entry.GetSequenceNumber())
 			}
+		}
+		// increment replication delete-range metric
+		if a.metrics != nil {
+			a.metrics.ReplicationDeleteRangeTotal.Add(1)
 		}
 
 	default:
@@ -1969,6 +2120,12 @@ func (a *Engine2Adapter) FlushMemtableToL0(mem *memtable.Memtable2, parentCtx co
 	if mem == nil {
 		return nil
 	}
+	start := time.Now()
+	defer func() {
+		if a != nil && a.metrics != nil && a.metrics.FlushLatencyHist != nil {
+			observeLatency(a.metrics.FlushLatencyHist, time.Since(start).Seconds())
+		}
+	}()
 
 	// Testing-only failure injection: allow tests to simulate transient flush errors.
 	// Testing-only failure injection: allow tests to simulate transient flush errors.
@@ -2267,6 +2424,36 @@ func (a *Engine2Adapter) FlushMemtableToL0(mem *memtable.Memtable2, parentCtx co
 		_ = WriteBlockIndexNamed(blockDir, named)
 	}
 
+	// Instrument flush metrics: count successful flushes, datapoints flushed
+	// and bytes written. Use best-effort file size lookup from the loaded
+	// SSTable or fallback to the writer path.
+	if a.metrics != nil {
+		// Increment flush counter
+		a.metrics.FlushTotal.Add(1)
+		// Number of datapoints flushed (estimate from mem.Len())
+		if mem != nil {
+			a.metrics.FlushDataPointsFlushedTotal.Add(int64(mem.Len()))
+		}
+		// Try to record bytes flushed using SSTable file size when available
+		var size int64 = 0
+		if sst != nil {
+			if fi, err := os.Stat(sst.FilePath()); err == nil {
+				size = fi.Size()
+			}
+		}
+		// Fallback to writer file path if size still unknown
+		if size == 0 {
+			if writer != nil {
+				if fi2, err2 := os.Stat(writer.FilePath()); err2 == nil {
+					size = fi2.Size()
+				}
+			}
+		}
+		if size > 0 {
+			a.metrics.FlushBytesFlushedTotal.Add(size)
+		}
+	}
+
 	return nil
 }
 
@@ -2329,6 +2516,12 @@ func (a *Engine2Adapter) rangeScan(seriesKey []byte, startTime, endTime int64, o
 	binary.BigEndian.PutUint64(endKey[len(seriesKey):], uint64(endTime+1))
 
 	var out []core.IteratorInterface[*core.IteratorNode]
+	start := time.Now()
+	defer func() {
+		if a != nil && a.metrics != nil && a.metrics.RangeScanLatencyHist != nil {
+			observeLatency(a.metrics.RangeScanLatencyHist, time.Since(start).Seconds())
+		}
+	}()
 	// memtable iterator (always include)
 	if a.mem != nil {
 		out = append(out, a.mem.NewIterator(startKey, endKey, order))
@@ -2516,6 +2709,30 @@ func (a *Engine2Adapter) Start() error {
 	// local flag to indicate we performed a fallback scan (no manifest entries)
 	didFallbackScanLocal := false
 
+	// Wire metric supplier functions so published expvar.Funcs (if any)
+	// can read runtime values. Use best-effort accessors and return 0
+	// when underlying state is not available yet.
+	if a.metrics != nil {
+		a.metrics.mutableMemtableSizeFunc = func() interface{} {
+			if a.Engine2 != nil && a.Engine2.mem != nil {
+				return a.Engine2.mem.Size()
+			}
+			return 0
+		}
+		a.metrics.immutableMemtablesCountFunc = func() interface{} {
+			// Adapter currently does not keep a persistent immutable queue
+			// outside of transient flush operations. Return 0 as a safe
+			// default until a more accurate counter is available.
+			return 0
+		}
+		a.metrics.immutableMemtablesTotalSizeBytesFunc = func() interface{} {
+			return 0
+		}
+		a.metrics.flushQueueLengthFunc = func() interface{} { return 0 }
+		a.metrics.diskUsageBytesFunc = func() interface{} { return 0 }
+		a.metrics.uptimeSecondsFunc = func() interface{} { return 0 }
+	}
+
 	// Ensure manifest manager is present and loaded.
 	if a.manifestMgr == nil && a.Engine2 != nil {
 		manifestPath := filepath.Join(a.Engine2.GetDataRoot(), "sstables", "manifest.json")
@@ -2660,12 +2877,18 @@ func (a *Engine2Adapter) Start() error {
 	if a.Engine2 != nil && a.Engine2.wal != nil {
 		// Annotate start of WAL replay with adapter id for tracing
 		slog.Default().Info("Starting WAL replay", "adapter_id", a.adapterID)
+
+		// Measure WAL replay duration and count recovered entries when metrics available.
+		walStart := time.Now()
 		// record sequence before replay so we can detect whether any WAL
 		// entries were applied.
 		// best-effort: ignore replay errors but log them via slog
 		_ = a.Engine2.wal.Replay(func(dp *core.DataPoint) error {
 			// increment sequence count
 			seq := a.sequenceNumber.Add(1)
+			if a.metrics != nil {
+				a.metrics.WALRecoveredEntriesTotal.Add(1)
+			}
 
 			// determine if this WAL entry represents a point-delete (non-series timestamp with nil fields)
 			isPointDelete := dp.Timestamp != -1 && dp.Fields == nil
@@ -2838,6 +3061,10 @@ func (a *Engine2Adapter) Start() error {
 			}
 			return nil
 		})
+		// record total duration (seconds) for WAL recovery
+		if a.metrics != nil && a.metrics.WALRecoveryDurationSeconds != nil {
+			a.metrics.WALRecoveryDurationSeconds.Set(time.Since(walStart).Seconds())
+		}
 		// postSeq := a.sequenceNumber.Load()
 		// (diagnostics removed) WAL replay post-sequence previously printed here
 		// If we performed a fallback scan, enforce the legacy fallback behavior

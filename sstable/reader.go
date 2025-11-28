@@ -327,6 +327,12 @@ func (s *SSTable) Get(key []byte) (value []byte, entryType core.EntryType, err e
 	blockMeta, found := s.index.Find(key) // Find returns BlockIndexEntry
 	if !found {
 		s.logger.Debug("Key not found via index.Find", "key", string(key))
+		// If a Bloom filter existed and caller checked it, this situation
+		// likely represents a false-positive from the Bloom filter. Signal
+		// the hook so higher layers can increment false-positive metrics.
+		if s.filter != nil {
+			invokeBloomFalsePositiveHook()
+		}
 		return nil, 0, ErrNotFound
 	}
 
@@ -355,6 +361,9 @@ func (s *SSTable) Contains(key []byte) bool {
 	if s.filter == nil {
 		return true // No filter, so we must assume it might contain the key.
 	}
+	// Signal a Bloom filter check to any registered hook before returning
+	// the result. Higher layers may use the hook to increment metrics.
+	invokeBloomCheckHook()
 	return s.filter.Contains(key)
 }
 

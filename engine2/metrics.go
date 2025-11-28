@@ -3,6 +3,7 @@ package engine2
 import (
 	"expvar"
 	"fmt"
+	"strconv"
 )
 
 // EngineMetrics holds all expvar variables for a StorageEngine instance.
@@ -65,6 +66,9 @@ type EngineMetrics struct {
 	PreallocSuccesses   *expvar.Int
 	PreallocFailures    *expvar.Int
 	PreallocUnsupported *expvar.Int
+
+	// Derived metrics
+	IngestionRatio *expvar.Float
 
 	activeSeriesCountFunc                func() interface{}
 	mutableMemtableSizeFunc              func() interface{}
@@ -150,6 +154,71 @@ func NewEngineMetrics(publishGlobally bool, prefix string) *EngineMetrics {
 		PreallocSuccesses:   newIntFunc(prefix + "prealloc_successes_total"),
 		PreallocFailures:    newIntFunc(prefix + "prealloc_failures_total"),
 		PreallocUnsupported: newIntFunc(prefix + "prealloc_unsupported_total"),
+
+		IngestionRatio: newFloatFunc(prefix + "ingestion_ratio"),
+	}
+
+	// If requested, publish a small set of dynamic metrics exposed via
+	// expvar.Func that call into injected function hooks on the EngineMetrics
+	// instance. The functions are allowed to be nil (until callers set them);
+	// in that case the published Func will return 0.
+	if publishGlobally {
+		// Mutable memtable size in bytes
+		_ = expvar.Get(prefix + "mutable_memtable_size_bytes")
+		if expvar.Get(prefix+"mutable_memtable_size_bytes") == nil {
+			expvar.Publish(prefix+"mutable_memtable_size_bytes", expvar.Func(func() interface{} {
+				if em.mutableMemtableSizeFunc == nil {
+					return 0
+				}
+				return em.mutableMemtableSizeFunc()
+			}))
+		}
+
+		// Immutable memtables count
+		if expvar.Get(prefix+"immutable_memtables_count") == nil {
+			expvar.Publish(prefix+"immutable_memtables_count", expvar.Func(func() interface{} {
+				if em.immutableMemtablesCountFunc == nil {
+					return 0
+				}
+				return em.immutableMemtablesCountFunc()
+			}))
+		}
+
+		// Immutable memtables total size (bytes)
+		if expvar.Get(prefix+"immutable_memtables_total_size_bytes") == nil {
+			expvar.Publish(prefix+"immutable_memtables_total_size_bytes", expvar.Func(func() interface{} {
+				if em.immutableMemtablesTotalSizeBytesFunc == nil {
+					return 0
+				}
+				return em.immutableMemtablesTotalSizeBytesFunc()
+			}))
+		}
+
+		// Optional runtime gauges (best-effort; functions may be nil)
+		if expvar.Get(prefix+"flush_queue_length") == nil {
+			expvar.Publish(prefix+"flush_queue_length", expvar.Func(func() interface{} {
+				if em.flushQueueLengthFunc == nil {
+					return 0
+				}
+				return em.flushQueueLengthFunc()
+			}))
+		}
+		if expvar.Get(prefix+"disk_usage_bytes") == nil {
+			expvar.Publish(prefix+"disk_usage_bytes", expvar.Func(func() interface{} {
+				if em.diskUsageBytesFunc == nil {
+					return 0
+				}
+				return em.diskUsageBytesFunc()
+			}))
+		}
+		if expvar.Get(prefix+"uptime_seconds") == nil {
+			expvar.Publish(prefix+"uptime_seconds", expvar.Func(func() interface{} {
+				if em.uptimeSecondsFunc == nil {
+					return 0
+				}
+				return em.uptimeSecondsFunc()
+			}))
+		}
 	}
 
 	histMaps := []*expvar.Map{
@@ -167,6 +236,33 @@ func NewEngineMetrics(publishGlobally bool, prefix string) *EngineMetrics {
 		m.Set("le_inf", new(expvar.Int))
 	}
 	return em
+}
+
+// RecomputeIngestionRatio recalculates the ingestion success ratio and updates
+// the IngestionRatio expvar.Float. The ratio is defined as
+// PutTotal / (PutTotal + PutErrorsTotal). If there are no puts, ratio is 0.
+func (em *EngineMetrics) RecomputeIngestionRatio() {
+	if em == nil || em.IngestionRatio == nil || em.PutTotal == nil || em.PutErrorsTotal == nil {
+		return
+	}
+	// expvar.Int does not expose a typed getter, use String() and parse.
+	ptStr := em.PutTotal.String()
+	peStr := em.PutErrorsTotal.String()
+	var pt, pe int64
+	if v, err := strconv.ParseInt(ptStr, 10, 64); err == nil {
+		pt = v
+	}
+	if v, err := strconv.ParseInt(peStr, 10, 64); err == nil {
+		pe = v
+	}
+	denom := float64(pt + pe)
+	var ratio float64
+	if denom > 0 {
+		ratio = float64(pt) / denom
+	} else {
+		ratio = 0.0
+	}
+	em.IngestionRatio.Set(ratio)
 }
 
 func (em *EngineMetrics) GetActiveSeriesCount() (int, error) {
