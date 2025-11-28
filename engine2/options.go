@@ -42,6 +42,13 @@ type StorageEngineOptions struct {
 	WALFlushIntervalMs             int
 	WALPurgeKeepSegments           int
 	WALMaxSegmentSize              int64
+	// WALPreallocSize, when >0, specifies bytes to preallocate for new WAL segments.
+	// If zero, an appropriate default or fallback is used.
+	WALPreallocSize int64
+	// WALPreallocateSegments controls whether WAL segment files should be
+	// preallocated at creation time. When true, new segments will be
+	// preallocated to `WALPreallocSize` (or a default) if supported by the OS.
+	WALPreallocateSegments         bool
 	RetentionPeriod                string
 	MetadataSyncIntervalSeconds    int
 	EnableTagBloomFilter           bool

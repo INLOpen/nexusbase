@@ -399,7 +399,21 @@ func (a *Engine2Adapter) Put(ctx context.Context, point core.DataPoint) error {
 		return vErr
 	}
 
-	if err := a.wal.Append(&point); err != nil {
+	var vb []byte
+	if point.Fields != nil {
+		enc, err := point.Fields.Encode()
+		if err != nil {
+			if a.metrics != nil {
+				a.metrics.PutErrorsTotal.Add(1)
+				a.metrics.RecomputeIngestionRatio()
+			}
+			return fmt.Errorf("failed to encode datapoint fields: %w", err)
+		}
+		vb = enc
+	}
+	key := core.EncodeTSDBKeyWithString(point.Metric, point.Tags, point.Timestamp)
+	entry := core.WALEntry{EntryType: core.EntryTypePutEvent, Key: key, Value: vb}
+	if err := a.wal.Append(entry); err != nil {
 		if a.metrics != nil {
 			a.metrics.PutErrorsTotal.Add(1)
 			a.metrics.RecomputeIngestionRatio()
@@ -461,7 +475,7 @@ func (a *Engine2Adapter) Put(ctx context.Context, point core.DataPoint) error {
 	}
 
 	// Fallback: encode using string-key when id-encoding fails.
-	key := core.EncodeTSDBKeyWithString(point.Metric, point.Tags, point.Timestamp)
+	key = core.EncodeTSDBKeyWithString(point.Metric, point.Tags, point.Timestamp)
 	if len(point.Fields) == 0 {
 		seq := a.sequenceNumber.Add(1)
 		_ = a.mem.PutRaw(key, nil, core.EntryTypeDelete, seq)
@@ -631,9 +645,11 @@ func (a *Engine2Adapter) Delete(ctx context.Context, metric string, tags map[str
 	if a.wal == nil || a.mem == nil {
 		return fmt.Errorf("engine2 not initialized")
 	}
-	// append tombstone entry
+	// append tombstone entry to WAL (central wal expects core.WALEntry)
 	dp := core.DataPoint{Metric: metric, Tags: tags, Timestamp: timestamp, Fields: nil}
-	if err := a.wal.Append(&dp); err != nil {
+	key := core.EncodeTSDBKeyWithString(metric, tags, timestamp)
+	entry := core.WALEntry{EntryType: core.EntryTypeDelete, Key: key, Value: nil}
+	if err := a.wal.Append(entry); err != nil {
 		return fmt.Errorf("wal append failed: %w", err)
 	}
 	if a.metrics != nil {
@@ -673,7 +689,9 @@ func (a *Engine2Adapter) DeleteSeries(ctx context.Context, metric string, tags m
 	}
 	// represent series tombstone with timestamp -1
 	dp := core.DataPoint{Metric: metric, Tags: tags, Timestamp: -1, Fields: nil}
-	if err := a.wal.Append(&dp); err != nil {
+	key := core.EncodeTSDBKeyWithString(metric, tags, -1)
+	entry := core.WALEntry{EntryType: core.EntryTypeDelete, Key: key, Value: nil}
+	if err := a.wal.Append(entry); err != nil {
 		return fmt.Errorf("wal append failed: %w", err)
 	}
 	if a.metrics != nil {
@@ -779,7 +797,18 @@ func (a *Engine2Adapter) DeletesByTimeRange(ctx context.Context, metric string, 
 		fv["__range_delete_end"] = endPV
 		dp.Fields = fv
 	}
-	if err := a.wal.Append(&dp); err != nil {
+	// encode as WALEntry and append to central WAL
+	var vb []byte
+	if dp.Fields != nil {
+		enc, err := dp.Fields.Encode()
+		if err != nil {
+			return fmt.Errorf("failed to encode range tombstone fields: %w", err)
+		}
+		vb = enc
+	}
+	key := core.EncodeTSDBKeyWithString(metric, tags, startTime)
+	entry := core.WALEntry{EntryType: core.EntryTypeDelete, Key: key, Value: vb}
+	if err := a.wal.Append(entry); err != nil {
 		return fmt.Errorf("wal append failed: %w", err)
 	}
 	if entry, err := a.encodeDataPointToWALEntry(&dp); err == nil {
@@ -2874,6 +2903,11 @@ func (a *Engine2Adapter) Start() error {
 	// populated; if we performed a fallback scan we will enforce the
 	// legacy sequence-number semantics afterwards (reset to 0). Skipping
 	// replay prevented tag/index population in some test scenarios.
+	// If the engine failed to open WAL at construction, surface that error
+	// during Start() so callers (tests) observe the failure at startup.
+	if a.Engine2 != nil && a.Engine2.walOpenErr != nil {
+		return a.Engine2.walOpenErr
+	}
 	if a.Engine2 != nil && a.Engine2.wal != nil {
 		// Annotate start of WAL replay with adapter id for tracing
 		slog.Default().Info("Starting WAL replay", "adapter_id", a.adapterID)
@@ -2883,7 +2917,7 @@ func (a *Engine2Adapter) Start() error {
 		// record sequence before replay so we can detect whether any WAL
 		// entries were applied.
 		// best-effort: ignore replay errors but log them via slog
-		_ = a.Engine2.wal.Replay(func(dp *core.DataPoint) error {
+		_ = a.Engine2.ReplayWal(func(dp *core.DataPoint) error {
 			// increment sequence count
 			seq := a.sequenceNumber.Add(1)
 			if a.metrics != nil {
@@ -3265,7 +3299,7 @@ func (a *Engine2Adapter) GetWAL() wal.WALInterface {
 		return a.leaderWal
 	}
 	if a.wal != nil {
-		return &engine2WALWrapper{w: a.wal}
+		return &engine2WALWrapper{w: a.wal, path: a.GetWALPath()}
 	}
 	return &noopWAL{}
 }
@@ -3300,7 +3334,8 @@ func (a *Engine2Adapter) PurgeWALSegments(lastFlushed uint64, keepSegments int) 
 // are provided; other methods are no-ops to satisfy the interface for
 // snapshotting purposes.
 type engine2WALWrapper struct {
-	w *WAL
+	w    *wal.WAL
+	path string
 }
 
 func (e *engine2WALWrapper) AppendBatch(entries []core.WALEntry) error { return nil }
@@ -3314,10 +3349,7 @@ func (e *engine2WALWrapper) Close() error {
 	return e.w.Close()
 }
 func (e *engine2WALWrapper) Path() string {
-	if e.w == nil {
-		return ""
-	}
-	return filepath.Dir(e.w.path)
+	return e.path
 }
 func (e *engine2WALWrapper) SetTestingOnlyInjectCloseError(err error) {}
 func (e *engine2WALWrapper) ActiveSegmentIndex() uint64               { return 0 }

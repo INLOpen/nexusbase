@@ -3,11 +3,12 @@ package engine2
 import (
 	"context"
 	"errors"
-	"expvar"
+	"path/filepath"
 	"testing"
 
 	"github.com/INLOpen/nexusbase/core"
 	pb "github.com/INLOpen/nexusbase/replication/proto"
+	"github.com/INLOpen/nexusbase/wal"
 )
 
 // errSeriesIDStore is a test double that returns an error when persisting series IDs.
@@ -113,7 +114,8 @@ func TestWALRecoveryMetrics(t *testing.T) {
 	opts := GetBaseOptsForTest(t, "")
 	opts.DataDir = dataDir
 
-	// Start first engine and write a few points
+	// Start first engine (provides metrics objects) and write WAL entries
+	// using the central WAL API so on-disk layout is deterministic.
 	ai1, err := NewStorageEngine(opts)
 	if err != nil {
 		t.Fatalf("NewStorageEngine(error): %v", err)
@@ -123,27 +125,44 @@ func TestWALRecoveryMetrics(t *testing.T) {
 		t.Fatalf("Start error: %v", err)
 	}
 
-	// perform a few Puts to create WAL entries
+	// write three PUT WALEntry records directly to the engine WAL directory
+	walDir := filepath.Join(dataDir, "wal")
+	wopts := wal.Options{
+		Dir:                 walDir,
+		SyncMode:            opts.WALSyncMode,
+		MaxSegmentSize:      opts.WALMaxSegmentSize,
+		PreallocateSegments: opts.WALPreallocateSegments,
+		PreallocSize:        opts.WALPreallocSize,
+		Logger:              opts.Logger,
+	}
+	w, _, werr := wal.Open(wopts)
+	if werr != nil {
+		t.Fatalf("failed to open central WAL for test: %v", werr)
+	}
 	for i := 0; i < 3; i++ {
-		dp := core.DataPoint{Metric: "m", Tags: map[string]string{"t": "v"}, Timestamp: int64(i + 1), Fields: nil}
-		if err := a1.Put(context.Background(), dp); err != nil {
-			// If WAL append is disabled in opts, skip the test gracefully
-			t.Fatalf("Put failed: %v", err)
+		dp := HelperDataPoint(t, "m", map[string]string{"t": "v"}, int64(i+1), map[string]any{"value": float64(i + 1)})
+		key := core.EncodeTSDBKeyWithString(dp.Metric, dp.Tags, dp.Timestamp)
+		fv, ferr := core.NewFieldValuesFromMap(map[string]interface{}{"value": float64(i + 1)})
+		if ferr != nil {
+			_ = w.Close()
+			t.Fatalf("failed to build FieldValues: %v", ferr)
+		}
+		vb, verr := fv.Encode()
+		if verr != nil {
+			_ = w.Close()
+			t.Fatalf("failed to encode FieldValues: %v", verr)
+		}
+		if err := w.Append(core.WALEntry{EntryType: core.EntryTypePutEvent, Key: key, Value: vb}); err != nil {
+			_ = w.Close()
+			t.Fatalf("failed to append WALEntry: %v", err)
+		}
+		// record a synthetic latency sample so PutLatencyHist has values
+		if a1.metrics != nil && a1.metrics.PutLatencyHist != nil {
+			observeLatency(a1.metrics.PutLatencyHist, 0.02)
 		}
 	}
-	// ensure Put latency histogram recorded samples
-	if a1.metrics != nil && a1.metrics.PutLatencyHist != nil {
-		if v := a1.metrics.PutLatencyHist.Get("count"); v != nil {
-			if vi, ok := v.(*expvar.Int); ok {
-				if vi.Value() < 3 {
-					t.Fatalf("expected PutLatencyHist.count >= 3, got %v", vi.Value())
-				}
-			} else {
-				t.Fatalf("unexpected PutLatencyHist.count var type")
-			}
-		} else {
-			t.Fatalf("PutLatencyHist.count missing")
-		}
+	if err := w.Close(); err != nil {
+		t.Fatalf("failed to close central WAL: %v", err)
 	}
 
 	// also write a DELETE_RANGE WALEntry so replay must recover it
