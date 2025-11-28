@@ -63,7 +63,7 @@ engine:
 
 # Logging configuration
 logging:
-  level: "warn"   # "debug", "info", "warn", "error"
+  level: "info"   # "debug", "info", "warn", "error"
   output: "stdout" # "stdout", "file", "none"
   file: "nexusbase.log" # Path for 'file' output
 

@@ -773,7 +773,7 @@ func (w *WAL) notifyStreamers(entries []core.WALEntry) {
 		}
 		// Use Info level here so the dispatch is visible in test runs and can
 		// be correlated with committer and stream-reader logs.
-		w.logger.Info("WAL: dispatching notify payload", "notify_id", notifyID, "streamer_id", id, "seq_preview", preview)
+		w.logger.Debug("WAL: dispatching notify payload", "notify_id", notifyID, "streamer_id", id, "seq_preview", preview)
 		payload := notifyPayload{notifyID: notifyID, entries: batch}
 		select {
 		case streamer.notifyC <- payload:
