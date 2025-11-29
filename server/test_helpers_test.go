@@ -19,3 +19,15 @@ func setupEngineStart(t *testing.T, opts engine2.StorageEngineOptions) engine2.S
 	}
 	return eng
 }
+
+// setupEngineNoStart creates a StorageEngine but does not start it.
+// Useful when the test needs to manipulate internals before Start()
+// or assert Start() error behavior.
+func setupEngineNoStart(t *testing.T, opts engine2.StorageEngineOptions) engine2.StorageEngineInterface {
+	t.Helper()
+	eng, err := engine2.NewStorageEngine(opts)
+	if err != nil {
+		t.Fatalf("NewStorageEngine failed: %v", err)
+	}
+	return eng
+}

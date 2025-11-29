@@ -1,4 +1,4 @@
-package replication_test
+package server
 
 import (
 	"testing"
@@ -6,6 +6,8 @@ import (
 	"github.com/INLOpen/nexusbase/engine2"
 )
 
+// setupEngineStart creates a StorageEngine from opts, starts it, and
+// fatals on error. Caller is responsible for closing the engine when done.
 func setupEngineStart(t *testing.T, opts engine2.StorageEngineOptions) engine2.StorageEngineInterface {
 	t.Helper()
 	eng, err := engine2.NewStorageEngine(opts)
@@ -19,8 +21,8 @@ func setupEngineStart(t *testing.T, opts engine2.StorageEngineOptions) engine2.S
 }
 
 // setupEngineNoStart creates a StorageEngine but does not start it.
-// Useful when the test needs to manipulate internals before Start()
-// or assert Start() error behavior.
+// Useful when the test needs to hand the engine to other components
+// which will manage starting it.
 func setupEngineNoStart(t *testing.T, opts engine2.StorageEngineOptions) engine2.StorageEngineInterface {
 	t.Helper()
 	eng, err := engine2.NewStorageEngine(opts)
