@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -98,6 +99,12 @@ func NewEngine2(ctx context.Context, opts StorageEngineOptions) (*Engine2, error
 	}
 
 	w, recovered, err := wal.Open(wOpts)
+	// diagnostic: recovered entries logged at debug level
+	if w != nil {
+		slog.Default().Debug("WAL opened in NewEngine2", "wal_dir", w.Path(), "recovered_count", len(recovered))
+	} else {
+		slog.Default().Debug("WAL opened in NewEngine2 (nil WAL)", "recovered_count", len(recovered))
+	}
 	// Do not fail construction on WAL open errors; store the error and
 	// continue. Tests expect NewStorageEngine() to succeed even when WAL
 	// recovery later fails; Start() will surface the WAL error.
@@ -133,6 +140,7 @@ func NewEngine2(ctx context.Context, opts StorageEngineOptions) (*Engine2, error
 // string mappings and preserves exact on-disk key bytes.
 func (e *Engine2) ReplayWal(fn func(*core.WALEntry) error) error {
 	for _, entry := range e.walRecovered {
+		slog.Default().Debug("Engine2.ReplayWal: recovered entry", "seq", entry.SeqNum, "key_len", len(entry.Key))
 		if err := fn(&entry); err != nil {
 			return err
 		}

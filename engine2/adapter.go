@@ -659,12 +659,15 @@ func (a *Engine2Adapter) Get(ctx context.Context, metric string, tags map[string
 		}
 	}
 
-	// Memtable did not contain the key. As a fallback (useful for
-	// tests that initialize state via fallback-scan over SSTables), scan
-	// on-disk SSTables under the data dir and attempt to read the key.
-	// This is intentionally a best-effort and relatively expensive path;
-	// higher-performance lookups should use tag index + levels manager.
-	if a.GetDataDir() != "" {
+	// Memtable did not contain the key.
+	// As a fallback, optionally scan on-disk SSTables under the data dir
+	// and attempt to read the key. This fallback is intended only for
+	// databases that were initialized via a fallback scan at startup
+	// (indicated by `fallbackScanned`). Avoiding this expensive path for
+	// regular runtimes preserves expected semantics where SSTables are
+	// made visible via the LevelsManager/TagIndex instead of blind disk
+	// scans.
+	if a.GetDataDir() != "" && a.fallbackScanned.Load() {
 		key := core.EncodeTSDBKeyWithString(metric, tags, timestamp)
 		// search legacy `sst` and new `sstables` dirs
 		dirs := []string{filepath.Join(a.GetDataDir(), "sst"), filepath.Join(a.GetDataDir(), "sstables")}

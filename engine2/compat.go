@@ -36,6 +36,11 @@ func NewStorageEngine(opts StorageEngineOptions) (StorageEngineInterface, error)
 	}
 	// Wrap Engine2 in the adapter which implements engine2.StorageEngineInterface
 	a := NewEngine2AdapterWithHooks(e, opts.HookManager)
+	// Note: do not auto-start the adapter here. Callers should invoke
+	// `Start()` explicitly when they want WAL replay and background
+	// managers to be initialized. Tests and callers that depended on the
+	// previous automatic-start behavior should be updated to call
+	// `Start()` manually.
 	if prevLogger != nil {
 		slog.SetDefault(prevLogger)
 	}
