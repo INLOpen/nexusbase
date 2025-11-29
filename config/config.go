@@ -71,6 +71,11 @@ type CompactionConfig struct {
 
 // WALConfig holds Write-Ahead Log specific configurations.
 type WALConfig struct {
+	// SyncMode controls how the WAL is persisted to disk. Valid values:
+	// - "always": fsync after every append (highest durability, lowest throughput)
+	// - "batch": fsync once per logical commit (good durability/throughput tradeoff)
+	// - "interval": periodic fsyncs driven by the engine (engine will call Sync())
+	// - "disabled": no fsyncs (only for testing/benchmarks; data loss risk)
 	SyncMode            string `yaml:"sync_mode"`
 	BatchSize           int    `yaml:"batch_size"`
 	FlushInterval       string `yaml:"flush_interval"`

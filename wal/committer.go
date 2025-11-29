@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/INLOpen/nexusbase/core"
 )
@@ -13,6 +14,7 @@ import (
 // own file to reduce the size of wal.go and make the committer logic easier
 // to reason about.
 func (w *WAL) commit(records []*commitRecord) {
+	start := time.Now()
 	// Fast path: if WAL is closing, notify waiters and return.
 	if w.isClosing.Load() {
 		err := errors.New("wal is closed")
@@ -42,6 +44,9 @@ func (w *WAL) commit(records []*commitRecord) {
 		} else if w.opts.SyncMode != core.WALSyncDisabled {
 			if w.activeSegment != nil {
 				err = w.activeSegment.Sync()
+				if err == nil && w.TestingOnlySyncCount != nil {
+					w.TestingOnlySyncCount.Add(1)
+				}
 			}
 		}
 		w.mu.Unlock()
@@ -177,6 +182,7 @@ func (w *WAL) commit(records []*commitRecord) {
 	var totalEntries int
 
 	for pi, payload := range encodedEntries {
+		payloadStart := time.Now()
 		payloadBytes := payload
 		newRecordSize := int64(len(payloadBytes) + 8)
 		// (debug prints removed)
@@ -205,9 +211,17 @@ func (w *WAL) commit(records []*commitRecord) {
 
 		// perform the write and optional sync while holding the lock to preserve ordering
 		writeErr := w.activeSegment.WriteRecord(payloadBytes)
-		if writeErr == nil && w.opts.SyncMode != core.WALSyncDisabled {
+		// Only perform per-payload syncs when sync mode is explicitly "always".
+		if writeErr == nil && w.opts.SyncMode == core.WALSyncAlways {
 			writeErr = w.activeSegment.Sync()
+			if writeErr == nil && w.TestingOnlySyncCount != nil {
+				w.TestingOnlySyncCount.Add(1)
+			}
 		}
+
+		// log payload write+sync duration for diagnostics
+		payloadDur := time.Since(payloadStart)
+		slog.Default().Info("WAL: payload write+sync", "payload_index", pi, "duration_ms", payloadDur.Milliseconds(), "payload_bytes", len(payloadBytes))
 
 		// If this payload requested rotation (only at end), will perform after loop
 		w.mu.Unlock()
@@ -257,13 +271,27 @@ func (w *WAL) commit(records []*commitRecord) {
 		w.mu.Unlock()
 	}
 
+	// If configured for batch sync, perform a single Sync() for the commit
+	// after all payloads have been written. This provides durability at the
+	// commit granularity without doing an fsync per payload.
+	if finalErr == nil && w.opts.SyncMode == core.WALSyncBatch {
+		w.mu.Lock()
+		if w.activeSegment != nil {
+			if err := w.activeSegment.Sync(); err != nil {
+				finalErr = err
+			} else if w.TestingOnlySyncCount != nil {
+				w.TestingOnlySyncCount.Add(1)
+			}
+		}
+		w.mu.Unlock()
+	}
+
 	// Notify all original waiters of the final result (same error for everyone)
 	for _, rec := range records {
 		rec.done <- finalErr
 	}
-	// update metrics (silence unused vars if not used elsewhere)
-	_ = totalBytes
-	_ = totalEntries
+	// update metrics and log overall commit duration for diagnostics
+	slog.Default().Info("WAL: commit processed", "records", len(records), "duration_ms", time.Since(start).Milliseconds(), "total_bytes", totalBytes, "total_entries", totalEntries)
 }
 
 // encodeEntryToSlice appends the binary encoding of a WALEntry into the provided
