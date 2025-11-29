@@ -126,41 +126,14 @@ func NewEngine2(ctx context.Context, opts StorageEngineOptions) (*Engine2, error
 	return &Engine2{ctx: ctx, cancel: cancel, options: options, wal: w, walRecovered: recovered, walOpenErr: walOpenErr, mem: m}, nil
 }
 
-// ReplayWal replays recovered WAL entries (from startup) into the provided
-// callback. This replaces the old engine2.WAL Replay method that no longer
-// exists now that the engine uses the central WAL package directly.
-// The callback receives the decoded DataPoint and the original WAL
-// sequence number for that entry so callers can preserve on-disk sequence
-// semantics during recovery.
-func (e *Engine2) ReplayWal(fn func(*core.DataPoint, uint64) error) error {
-	for _, eEntry := range e.walRecovered {
-		// Decode key into components for all entry types and pass through
-		// as a DataPoint. The adapter's replay callback interprets deletes
-		// and special range-delete markers based on timestamp/fields.
-		seriesID, serr := core.ExtractSeriesIdentifierFromTSDBKeyWithString(eEntry.Key)
-		if serr != nil {
-			return fmt.Errorf("failed to extract series id from WAL key: %w", serr)
-		}
-		metricPart, _ := core.ExtractMetricFromSeriesKeyWithString(seriesID)
-		tagsMap, _ := core.ExtractTagsFromSeriesKeyWithString(seriesID)
-		if len(eEntry.Key) < 8 {
-			return fmt.Errorf("wal key too short to contain timestamp")
-		}
-		tsBytes := eEntry.Key[len(eEntry.Key)-8:]
-		ts := int64(0)
-		for i := 0; i < 8; i++ {
-			ts = (ts << 8) | int64(tsBytes[i])
-		}
-		var fv core.FieldValues
-		if len(eEntry.Value) > 0 {
-			if decoded, derr := core.DecodeFieldsFromBytes(eEntry.Value); derr == nil {
-				fv = decoded
-			} else {
-				return fmt.Errorf("failed to decode WAL entry value: %w", derr)
-			}
-		}
-		dp := &core.DataPoint{Metric: string(metricPart), Tags: tagsMap, Timestamp: ts, Fields: fv}
-		if err := fn(dp, eEntry.SeqNum); err != nil {
+// ReplayWal replays recovered WALEntry objects (from startup) into the
+// provided callback. The callback receives the raw *core.WALEntry so callers
+// (adapters) with access to string stores can decode keys using their
+// local dictionaries. This avoids forcing Engine2 to depend on adapter
+// string mappings and preserves exact on-disk key bytes.
+func (e *Engine2) ReplayWal(fn func(*core.WALEntry) error) error {
+	for _, entry := range e.walRecovered {
+		if err := fn(&entry); err != nil {
 			return err
 		}
 	}

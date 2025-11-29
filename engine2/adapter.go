@@ -3009,12 +3009,75 @@ func (a *Engine2Adapter) Start() error {
 		// Measure WAL replay duration and count recovered entries when metrics available.
 		walStart := time.Now()
 		// best-effort: ignore replay errors but log them via slog
-		_ = a.Engine2.ReplayWal(func(dp *core.DataPoint, seq uint64) error {
+		_ = a.Engine2.ReplayWal(func(e *core.WALEntry) error {
+			seq := e.SeqNum
+			// Decode the WALEntry key into a DataPoint using the adapter's
+			// stringStore (if available) so ID-encoded keys can be mapped
+			// back to strings. Support both ID-based and legacy string keys.
+			var dp core.DataPoint
+			// Ensure there is a timestamp suffix
+			if len(e.Key) < 8 {
+				slog.Default().Warn("WAL replay: key too short, skipping", "adapter_id", a.adapterID, "key_len", len(e.Key))
+				return nil
+			}
+			seriesKey := e.Key[:len(e.Key)-8]
+			// Attempt ID-based decode first
+			if mID, pairs, derr := core.DecodeSeriesKey(seriesKey); derr == nil {
+				// Map IDs back to strings using stringStore when present
+				var metricStr string
+				if a.stringStore != nil {
+					if ms, ok := a.stringStore.GetString(mID); ok {
+						metricStr = ms
+					}
+				}
+				tags := make(map[string]string)
+				if a.stringStore != nil {
+					for _, p := range pairs {
+						if kstr, ok := a.stringStore.GetString(p.KeyID); ok {
+							if vstr, ok2 := a.stringStore.GetString(p.ValueID); ok2 {
+								tags[kstr] = vstr
+							}
+						}
+					}
+				}
+				// decode timestamp
+				tsBytes := e.Key[len(e.Key)-8:]
+				ts := int64(0)
+				for i := 0; i < 8; i++ {
+					ts = (ts << 8) | int64(tsBytes[i])
+				}
+				dp.Metric = metricStr
+				dp.Tags = tags
+				dp.Timestamp = ts
+				if len(e.Value) > 0 {
+					if fv, derr2 := core.DecodeFieldsFromBytes(e.Value); derr2 == nil {
+						dp.Fields = fv
+					}
+				}
+			} else {
+				// Fallback: treat as legacy string-encoded key
+				seriesID, serr := core.ExtractSeriesIdentifierFromTSDBKeyWithString(e.Key)
+				if serr != nil {
+					slog.Default().Warn("WAL replay: failed to extract series id from key", "adapter_id", a.adapterID, "err", serr)
+					return nil
+				}
+				metricPart, _ := core.ExtractMetricFromSeriesKeyWithString(seriesID)
+				tagsMap, _ := core.ExtractTagsFromSeriesKeyWithString(seriesID)
+				tsBytes := e.Key[len(e.Key)-8:]
+				ts := int64(0)
+				for i := 0; i < 8; i++ {
+					ts = (ts << 8) | int64(tsBytes[i])
+				}
+				dp.Metric = string(metricPart)
+				dp.Tags = tagsMap
+				dp.Timestamp = ts
+				if len(e.Value) > 0 {
+					if fv, derr2 := core.DecodeFieldsFromBytes(e.Value); derr2 == nil {
+						dp.Fields = fv
+					}
+				}
+			}
 			slog.Default().Info("WAL replay callback: recovered entry", "adapter_id", a.adapterID, "seq", seq, "metric", dp.Metric)
-			// Use the original WAL-provided sequence number instead of
-			// allocating a new one. This preserves recovered sequence
-			// semantics and avoids double-incrementing the adapter's
-			// sequence counter.
 			if a.metrics != nil {
 				a.metrics.WALRecoveredEntriesTotal.Add(1)
 			}
@@ -3123,10 +3186,14 @@ func (a *Engine2Adapter) Start() error {
 					}
 					// ensure memtable has a tombstone for this representative key
 					if a.mem != nil {
-						if we, err := a.encodeDataPointToWALEntry(dp); err == nil {
+						if we, err := a.encodeDataPointToWALEntry(&dp); err == nil {
+							khex := hex.EncodeToString(we.Key)
+							slog.Default().Info("WAL replay: memtable PutRaw (range-delete)", "adapter_id", a.adapterID, "key_hex", khex, "seq", seq)
 							_ = a.mem.PutRaw(we.Key, nil, core.EntryTypeDelete, seq)
 						} else {
 							key := core.EncodeTSDBKeyWithString(dp.Metric, dp.Tags, dp.Timestamp)
+							khex := hex.EncodeToString(key)
+							slog.Default().Info("WAL replay: memtable PutRaw (range-delete)", "adapter_id", a.adapterID, "key_hex", khex, "seq", seq)
 							_ = a.mem.PutRaw(key, nil, core.EntryTypeDelete, seq)
 						}
 					}
@@ -3163,26 +3230,36 @@ func (a *Engine2Adapter) Start() error {
 				if isPointDelete {
 					// write delete tombstone using the same key encoding the
 					// adapter would normally use when encoding datapoints.
-					if we, err := a.encodeDataPointToWALEntry(dp); err == nil {
+					if we, err := a.encodeDataPointToWALEntry(&dp); err == nil {
+						khex := hex.EncodeToString(we.Key)
+						slog.Default().Info("WAL replay: memtable PutRaw (point-delete)", "adapter_id", a.adapterID, "key_hex", khex, "seq", seq)
 						_ = a.mem.PutRaw(we.Key, nil, core.EntryTypeDelete, seq)
 					} else {
 						key := core.EncodeTSDBKeyWithString(dp.Metric, dp.Tags, dp.Timestamp)
+						khex := hex.EncodeToString(key)
+						slog.Default().Info("WAL replay: memtable PutRaw (point-delete)", "adapter_id", a.adapterID, "key_hex", khex, "seq", seq)
 						_ = a.mem.PutRaw(key, nil, core.EntryTypeDelete, seq)
 					}
 				} else {
-					if we, err := a.encodeDataPointToWALEntry(dp); err == nil {
+					if we, err := a.encodeDataPointToWALEntry(&dp); err == nil {
+						khex := hex.EncodeToString(we.Key)
 						if we.EntryType == core.EntryTypeDelete || len(we.Value) == 0 {
+							slog.Default().Info("WAL replay: memtable PutRaw (delete-or-empty)", "adapter_id", a.adapterID, "key_hex", khex, "seq", seq)
 							_ = a.mem.PutRaw(we.Key, nil, core.EntryTypeDelete, seq)
 						} else {
+							slog.Default().Info("WAL replay: memtable PutRaw (put)", "adapter_id", a.adapterID, "key_hex", khex, "seq", seq, "val_len", len(we.Value))
 							_ = a.mem.PutRaw(we.Key, we.Value, core.EntryTypePutEvent, seq)
 						}
 					} else {
 						// fallback to string-key encoding
 						key := core.EncodeTSDBKeyWithString(dp.Metric, dp.Tags, dp.Timestamp)
+						khex := hex.EncodeToString(key)
 						if dp.Timestamp == -1 || len(dp.Fields) == 0 {
+							slog.Default().Info("WAL replay: memtable PutRaw (fallback-delete)", "adapter_id", a.adapterID, "key_hex", khex, "seq", seq)
 							_ = a.mem.PutRaw(key, nil, core.EntryTypeDelete, seq)
 						} else {
 							vb, _ := dp.Fields.Encode()
+							slog.Default().Info("WAL replay: memtable PutRaw (fallback-put)", "adapter_id", a.adapterID, "key_hex", khex, "seq", seq, "val_len", len(vb))
 							_ = a.mem.PutRaw(key, vb, core.EntryTypePutEvent, seq)
 						}
 					}
