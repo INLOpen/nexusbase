@@ -561,8 +561,11 @@ func (cm *CompactionManager) removeAndCleanupSSTables(ctx context.Context, table
 	for _, oldTable := range tables {
 		cm.logger.Info("Deleting old SSTable file after compaction.", "path", oldTable.FilePath(), "id", oldTable.ID())
 		if errClose := oldTable.Close(); errClose != nil {
-			cm.logger.Error("Error closing old SSTable before deletion.", "path", oldTable.FilePath(), "id", oldTable.ID(), "error", errClose)
-			allErrors = append(allErrors, fmt.Errorf("failed to close old SSTable %s: %w", oldTable.FilePath(), errClose))
+			// Ignore benign already-closed sentinel; otherwise record the error.
+			if errClose != sstable.ErrClosed {
+				cm.logger.Error("Error closing old SSTable before deletion.", "path", oldTable.FilePath(), "id", oldTable.ID(), "error", errClose)
+				allErrors = append(allErrors, fmt.Errorf("failed to close old SSTable %s: %w", oldTable.FilePath(), errClose))
+			}
 		}
 
 		if err := cm.fileRemover.Remove(oldTable.FilePath()); err != nil {
@@ -611,7 +614,11 @@ func (cm *CompactionManager) quarantineSSTables(ctx context.Context, tables []*s
 	}
 
 	for _, table := range tables {
-		table.Close()
+		if err := table.Close(); err != nil {
+			if err != sstable.ErrClosed {
+				cm.logger.Warn("Error closing quarantined SSTable", "path", table.FilePath(), "error", err)
+			}
+		}
 		destPath := filepath.Join(dlqDir, filepath.Base(table.FilePath()))
 		cm.logger.Info("Moving corrupted SSTable to quarantine.", "from", table.FilePath(), "to", destPath)
 		if err := sys.Rename(table.FilePath(), destPath); err != nil {
