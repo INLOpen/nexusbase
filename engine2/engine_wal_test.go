@@ -78,10 +78,9 @@ func TestStorageEngine_WALRecovery_CrashSimulation(t *testing.T) {
 
 	engine2 := setupStorageEngineStart(t, opts)
 	defer engine2.Close()
-	var err error
 
 	for i := 1; i <= 3; i++ {
-		retrievedValue, err = engine2.Get(context.Background(), "wal.metric", map[string]string{"id": fmt.Sprintf("%d", i)}, int64(i*1000))
+		retrievedValue, err := engine2.Get(context.Background(), "wal.metric", map[string]string{"id": fmt.Sprintf("%d", i)}, int64(i*1000))
 		if err != nil {
 			t.Errorf("engine2.Get failed for id %d after WAL recovery: %v", i, err)
 		}
@@ -594,6 +593,7 @@ func TestStorageEngine_WALRecovery_RangeTombstones(t *testing.T) {
 	metric := "sensor.temp"
 	tags := map[string]string{"location": "room1"}
 
+	var err error
 	_, err = engine2.Get(context.Background(), metric, tags, 2000)
 	if err != sstable.ErrNotFound {
 		t.Errorf("Expected range-deleted point at %d to be ErrNotFound after WAL recovery, got %v", 2000, err)
