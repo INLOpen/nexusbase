@@ -2890,7 +2890,7 @@ func (a *Engine2Adapter) Start() error {
 	}
 	// Create/open leader WAL (wal package) for replication/snapshot features
 	if a.leaderWal == nil && a.Engine2 != nil {
-		lw, err := openLeaderWAL(a.Engine2.GetDataRoot(), a.metrics)
+		lw, err := openLeaderWAL(a.Engine2, a.metrics)
 		if err != nil {
 			return err
 		}

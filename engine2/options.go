@@ -48,7 +48,10 @@ type StorageEngineOptions struct {
 	// WALPreallocateSegments controls whether WAL segment files should be
 	// preallocated at creation time. When true, new segments will be
 	// preallocated to `WALPreallocSize` (or a default) if supported by the OS.
-	WALPreallocateSegments         bool
+	// Use a pointer so callers can explicitly disable preallocation by
+	// providing `&false`. A nil value indicates no preference and the WAL
+	// package will apply its default.
+	WALPreallocateSegments         *bool
 	RetentionPeriod                string
 	MetadataSyncIntervalSeconds    int
 	EnableTagBloomFilter           bool

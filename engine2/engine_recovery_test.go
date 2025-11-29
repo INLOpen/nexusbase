@@ -7,6 +7,7 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/INLOpen/nexusbase/core"
 	"github.com/INLOpen/nexusbase/sstable"
 	"github.com/stretchr/testify/require"
 )
@@ -23,6 +24,9 @@ func TestWALRecovery_Successful(t *testing.T) {
 	}
 	opts := GetBaseOptsForTest(t, "test")
 	opts.DataDir = tempDir
+	// Ensure WAL writes are persisted so crash simulation produces on-disk
+	// WAL segments that the recovery procedure will replay.
+	opts.WALSyncMode = core.WALSyncAlways
 
 	dp1 := HelperDataPoint(t, "metric.a", map[string]string{"host": "server1"}, 100, map[string]interface{}{"value": 10.0})
 	dp2 := HelperDataPoint(t, "metric.b", map[string]string{"host": "server2"}, 200, map[string]interface{}{"value": 20.0})

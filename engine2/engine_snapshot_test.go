@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/INLOpen/nexusbase/core"
 	"github.com/INLOpen/nexusbase/sstable"
 	"github.com/INLOpen/nexusbase/sys"
 	"github.com/stretchr/testify/assert"
@@ -18,6 +19,9 @@ func TestEngine_SnapshotAndRestore(t *testing.T) {
 	// --- Phase 1: Setup a source engine and create a snapshot ---
 	sourceDir := t.TempDir()
 	sourceOpts := GetBaseOptsForTest(t, "test")
+	// Ensure WAL is durable so the snapshot's copied WAL directory contains
+	// well-formed WAL segments suitable for later restore/replay.
+	sourceOpts.WALSyncMode = core.WALSyncAlways
 	sourceOpts.DataDir = sourceDir
 
 	sourceEngine, err := NewStorageEngine(sourceOpts)
@@ -48,6 +52,7 @@ func TestEngine_SnapshotAndRestore(t *testing.T) {
 	// --- Phase 2: Setup a destination engine with different data ---
 	destDir := t.TempDir()
 	destOpts := GetBaseOptsForTest(t, "test")
+	destOpts.WALSyncMode = core.WALSyncAlways
 	destOpts.DataDir = destDir
 
 	destEngine, err := NewStorageEngine(destOpts)
@@ -91,6 +96,7 @@ func TestEngine_RestoreFromSnapshot_NoOverwrite(t *testing.T) {
 	// --- Phase 1: Create a snapshot ---
 	sourceDir := t.TempDir()
 	sourceOpts := GetBaseOptsForTest(t, "test")
+	sourceOpts.WALSyncMode = core.WALSyncAlways
 	sourceOpts.DataDir = sourceDir
 	sourceEngine, err := NewStorageEngine(sourceOpts)
 	require.NoError(t, err)
@@ -136,6 +142,7 @@ func TestEngine_RestoreFromSnapshot_ErrorHandling(t *testing.T) {
 		t.Helper()
 		sourceDir := t.TempDir()
 		sourceOpts := GetBaseOptsForTest(t, "test")
+		sourceOpts.WALSyncMode = core.WALSyncAlways
 		sourceOpts.DataDir = sourceDir
 		sourceEngine, err := NewStorageEngine(sourceOpts)
 		require.NoError(t, err)

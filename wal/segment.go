@@ -37,7 +37,11 @@ type SegmentReader struct {
 // `writerBufSize` configures the size of the buffered writer for this segment.
 func CreateSegment(dir string, index uint64, writerBufSize int, preallocSize int64) (*SegmentWriter, error) {
 	path := filepath.Join(dir, core.FormatSegmentFileName(index))
-	file, err := sys.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	// Open with O_APPEND so that writes are appended atomically by the OS
+	// even if multiple file descriptors exist for the same path. This
+	// prevents different handles with independent offsets from corrupting
+	// each other's writes on platforms that allow multiple opens.
+	file, err := sys.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|os.O_APPEND, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create segment file %s: %w", path, err)
 	}
@@ -119,25 +123,29 @@ func (sw *SegmentWriter) WriteRecord(data []byte) error {
 		return os.ErrClosed
 	}
 
-	// Write length
-	if err := binary.Write(sw.writer, binary.LittleEndian, uint32(len(data))); err != nil {
-		return fmt.Errorf("failed to write record length: %w", err)
-	}
-
-	// Write data
-	if _, err := sw.writer.Write(data); err != nil {
-		return fmt.Errorf("failed to write record data: %w", err)
-	}
-
-	// Write checksum
+	// Build the full record in a single buffer and write it with one
+	// buffered write call. This reduces the chance of interleaving writes
+	// from multiple syscalls which can corrupt records when multiple
+	// file descriptors exist for the same path even with O_APPEND.
 	checksum := crc32.ChecksumIEEE(data)
-	if err := binary.Write(sw.writer, binary.LittleEndian, checksum); err != nil {
-		return fmt.Errorf("failed to write record checksum: %w", err)
+	totalLen := 4 + len(data) + 4
+	buf := make([]byte, totalLen)
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(len(data)))
+	copy(buf[4:4+len(data)], data)
+	binary.LittleEndian.PutUint32(buf[4+len(data):], checksum)
+
+	if _, err := sw.writer.Write(buf); err != nil {
+		return fmt.Errorf("failed to write record buffer: %w", err)
 	}
 
-	// Update internal size tracker
-	sw.size += int64(4 + len(data) + 4) // length + data + checksum
+	// Flush buffered writer so data is persisted according to caller's
+	// expectations (Sync will be invoked by higher-level code when required).
+	if err := sw.writer.Flush(); err != nil {
+		return fmt.Errorf("failed to flush writer after record write: %w", err)
+	}
 
+	// Update internal size tracker (length + data + checksum)
+	sw.size += int64(totalLen)
 	return nil
 }
 

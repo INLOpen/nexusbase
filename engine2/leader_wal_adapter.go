@@ -12,15 +12,19 @@ import (
 // while engine2 keeps its own simple per-engine WAL file for replay.
 // The function accepts optional engine metrics so the WAL implementation can
 // update engine-level expvar counters (bytes/entries written).
-func openLeaderWAL(dataRoot string, metrics *EngineMetrics) (wal.WALInterface, error) {
-	// Use `wal/` directory for the leader WAL so tests that inspect
-	// `dataDir/wal` find the expected segment files.
-	dir := filepath.Join(dataRoot, "wal")
-	opts := wal.Options{
-		Dir: dir,
+func openLeaderWAL(engine *Engine2, metrics *EngineMetrics) (wal.WALInterface, error) {
+	// If we have an existing engine instance with an opened WAL, prefer
+	// to return a thin wrapper around that WAL instance rather than
+	// creating a second independent WAL writing to the same directory.
+	// Creating two WAL instances against the same directory can cause
+	// concurrent writers and corrupt segment contents.
+	if engine != nil && engine.wal != nil {
+		return &engine2WALWrapper{w: engine.wal, path: filepath.Join(engine.options.DataDir, "wal")}, nil
 	}
-	// Wire up metric pointers when provided so the WAL writer will update
-	// engine-level expvar counters.
+
+	// Otherwise, fall back to opening a standalone WAL in the data root.
+	dir := filepath.Join(engine.options.DataDir, "wal")
+	opts := wal.Options{Dir: dir}
 	if metrics != nil {
 		opts.BytesWritten = metrics.WALBytesWrittenTotal
 		opts.EntriesWritten = metrics.WALEntriesWrittenTotal

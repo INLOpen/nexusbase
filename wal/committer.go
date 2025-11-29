@@ -170,7 +170,7 @@ func (w *WAL) commit(records []*commitRecord) {
 			finalErr = err
 			break
 		}
-		headerSize := int64(binary.Size(core.FileHeader{}))
+		headerSize := fileHeaderSize
 		if (currentSize+newRecordSize) > w.opts.MaxSegmentSize && currentSize > headerSize {
 			if err := w.rotateLocked(); err != nil {
 				w.mu.Unlock()
