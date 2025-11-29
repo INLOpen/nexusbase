@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
-	"expvar"
 	"fmt"
 	"io"
 	"io/fs"
@@ -1272,32 +1271,14 @@ func (it *engine2QueryResultIterator) Close() error {
 	if !it.startTime.IsZero() && it.engine != nil {
 		duration := it.engine.clk.Now().Sub(it.startTime).Seconds()
 		if metrics, merr := it.engine.Metrics(); merr == nil && metrics != nil {
-			// Update QueryLatencyHist (expvar.Map of buckets with "count" and "sum")
+			// Update QueryLatencyHist (use observeLatency so buckets are updated)
 			if qh := metrics.QueryLatencyHist; qh != nil {
-				if ci := qh.Get("count"); ci != nil {
-					if ciInt, ok := ci.(*expvar.Int); ok {
-						ciInt.Add(1)
-					}
-				}
-				if s := qh.Get("sum"); s != nil {
-					if sf, ok := s.(*expvar.Float); ok {
-						sf.Set(sf.Value() + duration)
-					}
-				}
+				observeLatency(qh, duration)
 			}
 			// Update aggregation histogram when this was an aggregation query
 			if it.queryReqInfo != nil && len(it.queryReqInfo.AggregationSpecs) > 0 {
 				if ah := metrics.AggregationQueryLatencyHist; ah != nil {
-					if ac := ah.Get("count"); ac != nil {
-						if acInt, ok := ac.(*expvar.Int); ok {
-							acInt.Add(1)
-						}
-					}
-					if s := ah.Get("sum"); s != nil {
-						if sf, ok := s.(*expvar.Float); ok {
-							sf.Set(sf.Value() + duration)
-						}
-					}
+					observeLatency(ah, duration)
 				}
 			}
 		}
