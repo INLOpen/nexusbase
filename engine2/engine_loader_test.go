@@ -19,9 +19,7 @@ import (
 func TestStateLoader_Load_FreshStart(t *testing.T) {
 	opts := GetBaseOptsForTest(t, "test")
 
-	eng, err := NewStorageEngine(opts)
-	require.NoError(t, err)
-	require.NoError(t, eng.Start())
+	eng := setupStorageEngineStart(t, opts)
 	defer eng.Close()
 
 	// Fresh engine should start with sequence number 0 and a WAL present.
@@ -36,10 +34,7 @@ func TestStateLoader_Load_FromManifest(t *testing.T) {
 	opts.WALSyncMode = core.WALSyncAlways
 
 	// Phase 1: create engine and write data, then close cleanly to persist manifest
-	engine1, err := NewStorageEngine(opts)
-	require.NoError(t, err)
-	require.NoError(t, engine1.Start())
-
+	engine1 := setupStorageEngineStart(t, opts)
 	dp1 := HelperDataPoint(t, "metric.manifest", map[string]string{"id": "a"}, 100, map[string]interface{}{"value": 1.0})
 	require.NoError(t, engine1.Put(context.Background(), dp1))
 
@@ -68,9 +63,7 @@ func TestStateLoader_Load_FromManifest(t *testing.T) {
 	}
 
 	// Phase 2: create a new engine instance which should recover from manifest
-	engine2, err := NewStorageEngine(opts)
-	require.NoError(t, err)
-	require.NoError(t, engine2.Start())
+	engine2 := setupStorageEngineStart(t, opts)
 	defer engine2.Close()
 
 	// Sequence number may vary depending on exact recovery path; ensure
@@ -91,10 +84,7 @@ func TestStateLoader_Load_FallbackScan(t *testing.T) {
 	dataDir := opts.DataDir
 
 	// Phase 1: create a valid engine state with SSTables but no manifest
-	engine1, err := NewStorageEngine(opts)
-	require.NoError(t, err)
-	require.NoError(t, engine1.Start())
-
+	engine1 := setupStorageEngineStart(t, opts)
 	require.NoError(t, engine1.Put(context.Background(), HelperDataPoint(t, "metric.fallback", map[string]string{"id": "a"}, 100, map[string]interface{}{"value": 1.0})))
 	require.NoError(t, engine1.Put(context.Background(), HelperDataPoint(t, "metric.fallback", map[string]string{"id": "b"}, 200, map[string]interface{}{"value": 2.0})))
 	require.NoError(t, engine1.Close())
@@ -117,9 +107,7 @@ func TestStateLoader_Load_FallbackScan(t *testing.T) {
 	_ = os.RemoveAll(filepath.Join(opts.DataDir, "wal"))
 
 	// Phase 2: start new engine which should fallback-scan SSTables
-	engine2, err := NewStorageEngine(opts)
-	require.NoError(t, err)
-	require.NoError(t, engine2.Start())
+	engine2 := setupStorageEngineStart(t, opts)
 	defer engine2.Close()
 
 	// Sequence number may be reset to 0 on fallback
@@ -143,9 +131,7 @@ func TestStateLoader_Load_WithWALRecovery(t *testing.T) {
 	})
 
 	// Load and recover
-	engine2, err := NewStorageEngine(opts)
-	require.NoError(t, err)
-	require.NoError(t, engine2.Start())
+	engine2 := setupStorageEngineStart(t, opts)
 	defer engine2.Close()
 
 	// Sequence number should be restored from WAL

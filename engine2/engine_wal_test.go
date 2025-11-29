@@ -76,13 +76,7 @@ func TestStorageEngine_WALRecovery_CrashSimulation(t *testing.T) {
 		require.NoError(t, w.Close())
 	}
 
-	engine2, err := NewStorageEngine(opts)
-	if err != nil {
-		t.Fatalf("NewStorageEngine (engine2) for recovery failed: %v", err)
-	}
-	if err = engine2.Start(); err != nil {
-		t.Fatalf("Failed to start setup engine: %v", err)
-	}
+	engine2 := setupStorageEngineStart(t, opts)
 	defer engine2.Close()
 
 	for i := 1; i <= 3; i++ {

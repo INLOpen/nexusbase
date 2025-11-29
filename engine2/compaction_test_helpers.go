@@ -17,11 +17,14 @@ import (
 	"github.com/INLOpen/nexusbase/core"
 	"github.com/INLOpen/nexusbase/hooks"
 	"github.com/INLOpen/nexusbase/indexer"
+	"github.com/INLOpen/nexusbase/iterator"
 	"github.com/INLOpen/nexusbase/levels"
 	"github.com/INLOpen/nexusbase/replication/proto"
 	"github.com/INLOpen/nexusbase/snapshot"
 	"github.com/INLOpen/nexusbase/sstable"
+	"github.com/INLOpen/nexusbase/sys"
 	"github.com/INLOpen/nexusbase/wal"
+	"github.com/INLOpen/nexuscore/types"
 	"github.com/INLOpen/nexuscore/utils/clock"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/trace"
@@ -306,3 +309,217 @@ func (t *testEngine) GetStringStore() indexer.StringStoreInterface {
 }
 func (t *testEngine) GetSnapshotManager() snapshot.ManagerInterface { return nil }
 func (t *testEngine) GetSequenceNumber() uint64                     { return 0 }
+
+// setupCompactionManagerWithMockWriter creates a CompactionManager configured
+// with a provided MockSSTableWriter and a deterministic test LevelsManager.
+// This was previously defined in the compaction tests; centralizing it here
+// allows reuse across compaction-related tests.
+func setupCompactionManagerWithMockWriter(t *testing.T, mockWriter *MockSSTableWriter, clk clock.Clock) CompactionManagerInterface {
+	t.Helper()
+	logger := slog.Default()
+
+	lm, _ := levels.NewLevelsManager(3, 2, 1024, trace.NewNoopTracerProvider().Tracer("test"), levels.PickOldest, 1.5, 1.0)
+	t.Cleanup(func() { lm.Close() })
+
+	// Create a test engine that satisfies the minimal StorageEngineInterface
+	dataDir := t.TempDir()
+	sstDir := filepath.Join(dataDir, "sst")
+	_ = os.MkdirAll(sstDir, 0o755)
+	te := &testEngine{dataDir: dataDir, clk: clk}
+
+	mockRemover := &mockFileRemover{failPaths: map[string]error{filepath.Join(sstDir, "101.sst"): errMockRemove}}
+
+	cmParams := CompactionManagerParams{
+		LevelsManager: lm,
+		DataDir:       sstDir,
+		Opts: CompactionOptions{
+			TargetSSTableSize:          100,
+			LevelsTargetSizeMultiplier: 2,
+			CompactionIntervalSeconds:  3600,
+			SSTableCompressor:          &compressors.NoCompressionCompressor{},
+		},
+		Logger:               logger,
+		Tracer:               trace.NewNoopTracerProvider().Tracer("test"),
+		IsSeriesDeleted:      func(b []byte, u uint64) bool { return false },
+		IsRangeDeleted:       func(b []byte, i int64, u uint64) bool { return false },
+		ExtractSeriesKeyFunc: func(key []byte) ([]byte, error) { return key[:len(key)-8], nil },
+		FileRemover:          mockRemover,
+		SSTableWriterFactory: func(opts core.SSTableWriterOptions) (core.SSTableWriterInterface, error) {
+			if mockWriter.failLoad {
+				dummyPath := filepath.Join(sstDir, fmt.Sprintf("%d.corrupted", opts.ID))
+				os.WriteFile(dummyPath, []byte("corrupted data"), 0644)
+				mockWriter.filePath = dummyPath
+				mockWriter.id = opts.ID
+				return mockWriter, nil
+			}
+			mockWriter.filePath = filepath.Join(sstDir, fmt.Sprintf("%d.sst", opts.ID))
+			mockWriter.id = opts.ID
+			return mockWriter, nil
+		},
+		Engine: te,
+	}
+
+	cmIface, err := NewCompactionManager(cmParams)
+	if err != nil {
+		t.Fatalf("failed to create CompactionManager: %v", err)
+	}
+	return cmIface
+}
+
+var errMockRemove = fmt.Errorf("simulated os.Remove error")
+
+// MockSSTableWriter for testing CompactionManager error handling
+type MockSSTableWriter struct {
+	failAdd         bool
+	addErr          error
+	failFinish      bool
+	finishErr       error
+	currentSizeFunc func() int64
+	failLoad        bool
+	entries         []struct {
+		key       []byte
+		value     []byte
+		entryType core.EntryType
+		seqNum    uint64
+	}
+	filePath string
+	id       uint64
+}
+
+type controllableMockSSTableWriter struct {
+	core.SSTableWriterInterface
+	startSignal  chan bool
+	finishSignal chan bool
+	signaled     atomic.Bool
+}
+
+func (m *controllableMockSSTableWriter) Add(key, value []byte, entryType core.EntryType, seqNum uint64) error {
+	if !m.signaled.Load() {
+		if m.signaled.CompareAndSwap(false, true) {
+			if m.startSignal != nil {
+				m.startSignal <- true
+			}
+			if m.finishSignal != nil {
+				<-m.finishSignal
+			}
+		}
+	}
+	return m.SSTableWriterInterface.Add(key, value, entryType, seqNum)
+}
+
+func (m *MockSSTableWriter) Add(key, value []byte, entryType core.EntryType, seqNum uint64) error {
+	if m.failAdd {
+		return m.addErr
+	}
+	m.entries = append(m.entries, struct {
+		key       []byte
+		value     []byte
+		entryType core.EntryType
+		seqNum    uint64
+	}{key, value, entryType, seqNum})
+	return nil
+}
+func (m *MockSSTableWriter) Finish() error {
+	if m.failFinish {
+		return m.finishErr
+	}
+	return nil
+}
+func (m *MockSSTableWriter) Abort() error     { return nil }
+func (m *MockSSTableWriter) FilePath() string { return m.filePath }
+func (m *MockSSTableWriter) CurrentSize() int64 {
+	if m.currentSizeFunc != nil {
+		return m.currentSizeFunc()
+	}
+	return 1000000
+}
+
+type mockFileRemover struct {
+	mu           sync.Mutex
+	failPaths    map[string]error
+	removedFiles []string
+}
+
+func (m *mockFileRemover) Remove(name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err, ok := m.failPaths[name]; ok {
+		return err
+	}
+	if err := sys.Remove(name); err != nil {
+		return err
+	}
+	m.removedFiles = append(m.removedFiles, name)
+	return nil
+}
+
+func verifySSTableContent(t *testing.T, tables []*sstable.SSTable, expectedData map[string]string) {
+	t.Helper()
+	var iters []core.IteratorInterface[*core.IteratorNode]
+	for _, tbl := range tables {
+		iter, err := tbl.NewIterator(nil, nil, nil, types.Ascending)
+		if err != nil {
+			t.Fatalf("Failed to create iterator for table %d: %v", tbl.ID(), err)
+		}
+		iters = append(iters, iter)
+	}
+
+	mergeParams := iterator.MergingIteratorParams{
+		Iters:                iters,
+		IsSeriesDeleted:      func(b []byte, u uint64) bool { return false },
+		IsRangeDeleted:       func(b []byte, i int64, u uint64) bool { return false },
+		ExtractSeriesKeyFunc: func(key []byte) ([]byte, error) { return key[:len(key)-8], nil },
+		DecodeTsFunc:         core.DecodeTimestamp,
+	}
+	mergedIter, err := iterator.NewMergingIteratorWithTombstones(mergeParams)
+	if err != nil {
+		t.Fatalf("Failed to create merging iterator: %v", err)
+	}
+	defer mergedIter.Close()
+
+	actualData := make(map[string]string)
+	for mergedIter.Next() {
+		cur, err := mergedIter.At()
+		require.NoError(t, err)
+		keyBytes, valueBytes, entryType, _ := cur.Key, cur.Value, cur.EntryType, cur.SeqNum
+
+		if entryType == core.EntryTypePutEvent {
+			decodedFields, err := core.DecodeFieldsFromBytes(valueBytes)
+			if err != nil {
+				t.Fatalf("failed to decode fields during verification: %v", err)
+			}
+			if val, ok := decodedFields["value"]; ok {
+				if strVal, okStr := val.ValueString(); okStr {
+					actualData[string(keyBytes)] = strVal
+				} else {
+					t.Fatalf("field 'value' is not a string for key %x", keyBytes)
+				}
+			} else {
+				t.Fatalf("field 'value' not found for key %x", keyBytes)
+			}
+		}
+	}
+	if err := mergedIter.Error(); err != nil {
+		t.Fatalf("Merging iterator error: %v", err)
+	}
+
+	if len(actualData) != len(expectedData) {
+		t.Errorf("SSTable content count mismatch: got %d, want %d", len(actualData), len(expectedData))
+	}
+
+	for k, expectedV := range expectedData {
+		actualV, ok := actualData[k]
+		if !ok {
+			t.Errorf("Expected key not found in actual data: %x", []byte(k))
+			continue
+		}
+		if actualV != expectedV {
+			t.Errorf("Value mismatch for key %x: got %q, want %q", []byte(k), actualV, expectedV)
+		}
+	}
+	for k := range actualData {
+		if _, ok := expectedData[k]; !ok {
+			t.Errorf("Unexpected key found in actual data: %x", []byte(k))
+		}
+	}
+}

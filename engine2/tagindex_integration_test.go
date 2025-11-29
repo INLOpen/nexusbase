@@ -24,14 +24,8 @@ func TestTagIndexManager_NoZeroCompactionInterval(t *testing.T) {
 	// set a positive index compaction interval which should be propagated
 	opts.IndexCompactionIntervalSeconds = 37
 
-	ai, err := NewStorageEngine(opts)
-	if err != nil {
-		t.Fatalf("NewStorageEngine failed: %v", err)
-	}
+	ai := setupStorageEngineStart(t, opts)
 	a := ai.(*Engine2Adapter)
-	if startErr := a.Start(); startErr != nil {
-		t.Fatalf("Start failed: %v", startErr)
-	}
 	// allow a small window for synchronous startup logging
 	time.Sleep(50 * time.Millisecond)
 	out := buf.String()
@@ -39,7 +33,5 @@ func TestTagIndexManager_NoZeroCompactionInterval(t *testing.T) {
 		t.Fatalf("Found zero-interval warning in logs: %s", out)
 	}
 	// cleanup
-	if err := a.Close(); err != nil {
-		t.Fatalf("Close failed: %v", err)
-	}
+	closeAdapter(t, a)
 }
