@@ -52,10 +52,7 @@ func setupReplicationTest(t *testing.T) (*replicationTestHarness, func()) {
 	leaderCfg.Replication.Mode = "leader"
 	leaderCfg.Replication.ListenAddress = leaderAddr
 
-	leaderEngine, err := engine2.NewStorageEngine(leaderOpts)
-	require.NoError(t, err)
-	err = leaderEngine.Start()
-	require.NoError(t, err)
+	leaderEngine := setupEngineStart(t, leaderOpts)
 
 	replicationLogger := leaderOpts.Logger.With("component", "replication")
 
@@ -76,10 +73,7 @@ func setupReplicationTest(t *testing.T) (*replicationTestHarness, func()) {
 	followerCfg.Replication.Mode = "follower"
 	followerCfg.Replication.LeaderAddress = leaderAddr
 
-	followerEngine, err := engine2.NewStorageEngine(followerOpts)
-	require.NoError(t, err)
-	err = followerEngine.Start()
-	require.NoError(t, err)
+	followerEngine := setupEngineStart(t, followerOpts)
 
 	followerApplier := replication.NewWALApplier(
 		followerCfg.Replication.LeaderAddress,

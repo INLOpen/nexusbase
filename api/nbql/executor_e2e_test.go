@@ -73,10 +73,7 @@ func TestExecutor_E2E_SnapshotAndRestore(t *testing.T) {
 	sourceOpts := getBaseOptsForE2ETest(t)
 	sourceOpts.DataDir = sourceDir
 
-	sourceEngine, err := engine2.NewStorageEngine(sourceOpts)
-	require.NoError(t, err)
-	err = sourceEngine.Start()
-	require.NoError(t, err)
+	sourceEngine := setupEngineStart(t, sourceOpts)
 
 	// Put some data into the source engine
 	dp1 := HelperDataPoint(t, "e2e.snap", map[string]string{"id": "a"}, 100, map[string]interface{}{"value": 10.0})
@@ -105,10 +102,7 @@ func TestExecutor_E2E_SnapshotAndRestore(t *testing.T) {
 	destOpts := getBaseOptsForE2ETest(t)
 	destOpts.DataDir = destDir
 
-	destEngine, err := engine2.NewStorageEngine(destOpts)
-	require.NoError(t, err)
-	err = destEngine.Start()
-	require.NoError(t, err)
+	destEngine := setupEngineStart(t, destOpts)
 
 	dp3 := HelperDataPoint(t, "e2e.other", map[string]string{"id": "c"}, 300, map[string]interface{}{"value": 30.0})
 	require.NoError(t, destEngine.Put(ctx, dp3))
@@ -123,10 +117,7 @@ func TestExecutor_E2E_SnapshotAndRestore(t *testing.T) {
 	require.NoError(t, err)
 
 	// --- Phase 3: Restart engine and verify state ---
-	restartedEngine, err := engine2.NewStorageEngine(destOpts)
-	require.NoError(t, err)
-	err = restartedEngine.Start()
-	require.NoError(t, err)
+	restartedEngine := setupEngineStart(t, destOpts)
 	defer restartedEngine.Close()
 
 	// Verification
@@ -144,16 +135,14 @@ func TestExecutor_E2E_SnapshotAndRestore(t *testing.T) {
 
 func TestExecutor_E2E_RemoveSeries(t *testing.T) {
 	ctx := context.Background()
+	var err error
 
 	// --- Phase 1: Setup engine and ingest data ---
 	dataDir := t.TempDir()
 	opts := getBaseOptsForE2ETest(t)
 	opts.DataDir = dataDir
 
-	eng, err := engine2.NewStorageEngine(opts)
-	require.NoError(t, err)
-	err = eng.Start()
-	require.NoError(t, err)
+	eng := setupEngineStart(t, opts)
 	defer eng.Close()
 
 	// Data for the series to be removed
@@ -203,16 +192,14 @@ func TestExecutor_E2E_RemoveSeries(t *testing.T) {
 
 func TestExecutor_E2E_RemovePoint(t *testing.T) {
 	ctx := context.Background()
+	var err error
 
 	// --- Phase 1: Setup engine and ingest data ---
 	dataDir := t.TempDir()
 	opts := getBaseOptsForE2ETest(t)
 	opts.DataDir = dataDir
 
-	eng, err := engine2.NewStorageEngine(opts)
-	require.NoError(t, err)
-	err = eng.Start()
-	require.NoError(t, err)
+	eng := setupEngineStart(t, opts)
 	defer eng.Close()
 
 	// Data points for the same series at different timestamps
@@ -260,16 +247,14 @@ func TestExecutor_E2E_RemovePoint(t *testing.T) {
 
 func TestExecutor_E2E_RemoveRange(t *testing.T) {
 	ctx := context.Background()
+	var err error
 
 	// --- Phase 1: Setup engine and ingest data ---
 	dataDir := t.TempDir()
 	opts := getBaseOptsForE2ETest(t)
 	opts.DataDir = dataDir
 
-	eng, err := engine2.NewStorageEngine(opts)
-	require.NoError(t, err)
-	err = eng.Start()
-	require.NoError(t, err)
+	eng := setupEngineStart(t, opts)
 	defer eng.Close()
 
 	// Data points for the same series at different timestamps

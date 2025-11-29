@@ -19,15 +19,8 @@ func TestAppServerAcceptsEngine2Adapter(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	ai, err := engine2.NewStorageEngine(engine2.StorageEngineOptions{DataDir: tmpDir})
-	if err != nil {
-		t.Fatalf("NewStorageEngine failed: %v", err)
-	}
+	ai := setupEngineStart(t, engine2.StorageEngineOptions{DataDir: tmpDir})
 	ad := ai.(*engine2.Engine2Adapter)
-	if err := ad.Start(); err != nil {
-		_ = ad.Close()
-		t.Fatalf("failed to start engine2 adapter: %v", err)
-	}
 	defer ad.Close()
 
 	// Build a minimal config with ports 0 so server doesn't listen on network.
