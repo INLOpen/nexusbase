@@ -48,7 +48,7 @@ engine:
     sync_mode: "interval" # "always", "batch", "interval", "disabled"
     batch_size: 1
     flush_interval: "1000ms"
-    max_segment_size_bytes: 33554432 # 32 MiB
+    max_segment_size_bytes: 4194304 # 4 MiB
     purge_keep_segments: 4
 
   # --- Tag Index ---
@@ -63,7 +63,7 @@ engine:
 
 # Logging configuration
 logging:
-  level: "debug"   # "debug", "info", "warn", "error"
+  level: "info"   # "debug", "info", "warn", "error"
   output: "stdout" # "stdout", "file", "none"
   file: "nexusbase.log" # Path for 'file' output
 

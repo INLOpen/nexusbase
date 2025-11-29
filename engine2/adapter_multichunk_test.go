@@ -26,6 +26,11 @@ func TestAdapterWritesMultipleChunks(t *testing.T) {
 	}
 	a := ai.(*Engine2Adapter)
 
+	if err := a.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer a.Close()
+
 	// Build a large payload string to force chunk splitting.
 	bigStr := strings.Repeat("x", 1024) // 1KB payload
 	// Write enough samples so the aggregate > 16KB and will split into multiple chunks

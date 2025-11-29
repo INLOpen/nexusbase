@@ -23,6 +23,11 @@ import (
 	"github.com/INLOpen/nexusbase/sys"
 )
 
+// fileHeaderSize caches the on-disk size of a `core.FileHeader` so writers
+// and readers can agree on the header length without relying on repeated
+// calls to `binary.Size`. Use core.FileHeader.Size() to compute this value.
+var fileHeaderSize = int64((&core.FileHeader{}).Size())
+
 // commitRecord represents a single commit request to the WAL.
 // It bundles the entries to be written with a channel to signal completion.
 type commitRecord struct {
@@ -81,6 +86,8 @@ type WAL struct {
 
 	// Buffer pool for encoding WALEntry payloads to reduce allocations.
 	bufPool *sync.Pool
+	// sequenceCounter holds the last assigned sequence number for WAL entries.
+	sequenceCounter atomic.Uint64
 }
 
 var _ WALInterface = (*WAL)(nil)
@@ -157,7 +164,11 @@ type Options struct {
 	// PreallocateSegments controls whether new segment files should be preallocated
 	// to `PreallocSize` bytes at creation time. This is performed using a
 	// platform-specific helper and is best-effort by default.
-	PreallocateSegments bool
+	//
+	// Use a pointer so callers can explicitly disable preallocation by passing
+	// `&false`. A nil value means the caller did not specify a preference and
+	// the constructor will apply the default behavior.
+	PreallocateSegments *bool
 	// PreallocSize is the size (in bytes) to preallocate for new segments when
 	// `PreallocateSegments` is enabled. If zero, `MaxSegmentSize` is used.
 	PreallocSize int64
@@ -182,11 +193,12 @@ func Open(opts Options) (*WAL, []core.WALEntry, error) {
 	if opts.WriterBufferSize == 0 {
 		opts.WriterBufferSize = 64 * 1024 // 64 KiB default
 	}
-	// Default to preallocating segments; users can disable via Options.
-	if !opts.PreallocateSegments {
-		// If the user didn't explicitly set PreallocateSegments (zero value is false),
-		// enable it by default for better IO behavior.
-		opts.PreallocateSegments = true
+	// Default to preallocating segments; callers may explicitly disable this
+	// by passing `PreallocateSegments: &false` in Options. A nil pointer means
+	// no preference was provided and we enable preallocation by default.
+	if opts.PreallocateSegments == nil {
+		v := true
+		opts.PreallocateSegments = &v
 	}
 	if opts.PreallocSize == 0 {
 		opts.PreallocSize = opts.MaxSegmentSize
@@ -220,6 +232,17 @@ func Open(opts Options) (*WAL, []core.WALEntry, error) {
 	}
 
 	recoveredEntries, recoveryErr := w.recover(opts.StartRecoveryIndex)
+
+	// Initialize sequence counter from recovered entries so newly-written
+	// entries receive strictly-increasing sequence numbers that continue
+	// from on-disk values.
+	var maxSeq uint64
+	for _, re := range recoveredEntries {
+		if re.SeqNum > maxSeq {
+			maxSeq = re.SeqNum
+		}
+	}
+	w.sequenceCounter.Store(maxSeq)
 
 	if err := w.openForAppend(); err != nil {
 		return nil, nil, fmt.Errorf("failed to open WAL for appending: %w", err)
@@ -410,7 +433,7 @@ func (w *WAL) rotateLocked() error {
 	}
 
 	prealloc := int64(0)
-	if w.opts.PreallocateSegments {
+	if w.opts.PreallocateSegments != nil && *w.opts.PreallocateSegments {
 		prealloc = w.opts.PreallocSize
 	}
 	newSegment, err := CreateSegment(w.dir, nextIndex, w.opts.WriterBufferSize, prealloc)
@@ -438,6 +461,16 @@ func (w *WAL) rotateLocked() error {
 		w.hookManager.Trigger(context.Background(), hooks.NewPostWALRotateEvent(payload))
 	}
 	return nil
+}
+
+// rotate is a defensive wrapper that acquires the WAL mutex and then calls
+// rotateLocked. Some code paths call rotation while already holding the
+// mutex (and should call rotateLocked directly). Callers that do not hold
+// the lock should call rotate() to avoid races.
+func (w *WAL) rotate() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.rotateLocked()
 }
 
 // encodeEntryData is retained for compatibility with older codepaths that may
@@ -545,7 +578,13 @@ func (w *WAL) recover(startRecoveryIndex uint64) ([]core.WALEntry, error) {
 		allEntries = append(allEntries, entries...)
 	}
 
-	firstErr := <-errChan
+	// Drain errChan and return the first non-nil error if any workers failed.
+	var firstErr error
+	for e := range errChan {
+		if firstErr == nil && e != nil {
+			firstErr = e
+		}
+	}
 
 	sort.Slice(allEntries, func(i, j int) bool {
 		return allEntries[i].SeqNum < allEntries[j].SeqNum
@@ -583,6 +622,13 @@ func recoverFromSegment(filePath string, logger *slog.Logger) ([]core.WALEntry, 
 }
 
 func (w *WAL) openForAppend() error {
+	// Acquire the WAL lock while opening/rotating so that concurrent
+	// committers cannot race with segment creation. Some callers may run
+	// this during initialization (no concurrency), but taking the lock is
+	// cheap and makes the behavior consistent.
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
 	if len(w.segmentIndexes) == 0 {
 		return w.rotateLocked()
 	}
@@ -595,7 +641,7 @@ func (w *WAL) openForAppend() error {
 		return fmt.Errorf("failed to stat last segment %s: %w", path, err)
 	}
 
-	headerSize := int64(binary.Size(core.FileHeader{}))
+	headerSize := fileHeaderSize
 
 	// If the last segment already contains data beyond the header, rotate
 	// to start a fresh segment for appends.
@@ -605,7 +651,11 @@ func (w *WAL) openForAppend() error {
 
 	// The last segment exists but only contains the header (empty).
 	// Open it for append without truncating so we don't lose state.
-	f, err := sys.OpenFile(path, os.O_RDWR, 0644)
+	// Open existing segment for append. Use O_APPEND to ensure writes are
+	// appended by the OS even if another descriptor exists for the same
+	// file (prevents races where independent offsets cause overlapping
+	// writes on platforms that permit multiple open handles).
+	f, err := sys.OpenFile(path, os.O_RDWR|os.O_APPEND, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to open existing WAL segment for append %s: %w", path, err)
 	}
@@ -773,7 +823,7 @@ func (w *WAL) notifyStreamers(entries []core.WALEntry) {
 		}
 		// Use Info level here so the dispatch is visible in test runs and can
 		// be correlated with committer and stream-reader logs.
-		w.logger.Info("WAL: dispatching notify payload", "notify_id", notifyID, "streamer_id", id, "seq_preview", preview)
+		w.logger.Debug("WAL: dispatching notify payload", "notify_id", notifyID, "streamer_id", id, "seq_preview", preview)
 		payload := notifyPayload{notifyID: notifyID, entries: batch}
 		select {
 		case streamer.notifyC <- payload:

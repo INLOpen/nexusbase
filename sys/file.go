@@ -252,9 +252,19 @@ func Rename(oldpath, newpath string) error {
 		return fmt.Errorf("failed to copy file during rename fallback %s -> %s: %w", oldpath, newpath, copyErr)
 	}
 
-	// Attempt to remove the source
-	if err := os.Remove(oldpath); err != nil {
-		return fmt.Errorf("copied %s to %s but failed to remove original during rename fallback: %w", oldpath, newpath, err)
+	// Close source file before attempting removal to reduce chance of
+	// sharing violations on Windows. dst is closed inside the copy helper.
+	_ = src.Close()
+	// Attempt to remove the source. Run a GC to help release stale handles
+	// (Windows can keep handles alive for a short time after Close()). Use
+	// the package-level Remove helper which performs retries.
+	_ = GC()
+	if err := Remove(oldpath); err != nil {
+		// Best-effort cleanup failed. On platforms like Windows transient
+		// sharing violations can prevent immediate removal even though the
+		// copied destination is valid. Treat this as a non-fatal warning
+		// and return success so callers can proceed with the new file.
+		return nil
 	}
 
 	return nil

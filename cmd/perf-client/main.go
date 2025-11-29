@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"os"
@@ -52,8 +53,18 @@ func main() {
 	numSeries := flag.Int("series", 100, "Number of unique time series to generate")
 	batchSize := flag.Int("batch-size", 1000, "Number of data points per PutBatch request")
 	concurrency := flag.Int("concurrency", 10, "Number of concurrent writers (goroutines)")
+	verbose := flag.Bool("verbose", false, "Enable verbose logging")
 
 	flag.Parse()
+
+	// Configure logging according to verbose flag. When not verbose, silence the
+	// `log` package output; final results printed with fmt remain visible.
+	if !*verbose {
+		log.SetOutput(io.Discard)
+	} else {
+		log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+		log.Println("Verbose logging enabled")
+	}
 
 	// --- gRPC Connection Setup ---
 	var opts []grpc.DialOption

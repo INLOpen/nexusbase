@@ -6,13 +6,12 @@ import (
 	"time"
 
 	"github.com/INLOpen/nexusbase/core"
-	"github.com/INLOpen/nexusbase/sys"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func init() {
-	sys.SetDebugMode(false)
+	// sys.SetDebugMode(false)
 }
 
 func TestStorageEngine_PutEvent(t *testing.T) {

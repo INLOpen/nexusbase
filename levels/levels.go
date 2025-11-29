@@ -424,8 +424,16 @@ func (lm *LevelsManager) Close() error {
 	var firstErr error
 	for _, levelState := range lm.levels {
 		for _, table := range levelState.GetTables() {
-			if table != nil { // Check if table is not nil
-				if err := table.Close(); err != nil && firstErr == nil {
+			if table == nil {
+				continue
+			}
+			if err := table.Close(); err != nil {
+				// Treat already-closed tables as benign (idempotent Close()).
+				// Only record and return the first non-trivial error.
+				if err == sstable.ErrClosed {
+					continue
+				}
+				if firstErr == nil {
 					firstErr = fmt.Errorf("failed to close table ID %d in level %d: %w", table.ID(), levelState.levelNumber, err)
 				}
 			}

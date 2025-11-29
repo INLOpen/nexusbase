@@ -42,6 +42,16 @@ type StorageEngineOptions struct {
 	WALFlushIntervalMs             int
 	WALPurgeKeepSegments           int
 	WALMaxSegmentSize              int64
+	// WALPreallocSize, when >0, specifies bytes to preallocate for new WAL segments.
+	// If zero, an appropriate default or fallback is used.
+	WALPreallocSize int64
+	// WALPreallocateSegments controls whether WAL segment files should be
+	// preallocated at creation time. When true, new segments will be
+	// preallocated to `WALPreallocSize` (or a default) if supported by the OS.
+	// Use a pointer so callers can explicitly disable preallocation by
+	// providing `&false`. A nil value indicates no preference and the WAL
+	// package will apply its default.
+	WALPreallocateSegments         *bool
 	RetentionPeriod                string
 	MetadataSyncIntervalSeconds    int
 	EnableTagBloomFilter           bool
@@ -82,6 +92,15 @@ type StorageEngineOptions struct {
 	// compatibility helpers. When present, the adapter will be created with
 	// this hook manager so callers can receive hook events.
 	HookManager hooks.HookManager
+
+	// TmpFileCleanupThresholdSeconds controls how old `.tmp` SSTable files
+	// must be (in seconds) before they are cleaned up at startup or by the
+	// periodic background cleaner. If zero, a default of 60 seconds is used.
+	TmpFileCleanupThresholdSeconds int
+
+	// TmpFileCleanupIntervalSeconds controls the periodic cleanup interval
+	// (in seconds). If zero, no periodic cleanup goroutine is started.
+	TmpFileCleanupIntervalSeconds int
 }
 
 // RoundingRule mirrors the helper type used by engine tests for relative

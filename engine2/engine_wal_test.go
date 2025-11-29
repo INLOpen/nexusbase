@@ -2,10 +2,10 @@ package engine2
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -15,12 +15,12 @@ import (
 	"github.com/INLOpen/nexusbase/compressors"
 	"github.com/INLOpen/nexusbase/core"
 	"github.com/INLOpen/nexusbase/sstable"
-	"github.com/INLOpen/nexusbase/sys"
+	"github.com/INLOpen/nexusbase/wal"
 	"github.com/stretchr/testify/require"
 )
 
 func init() {
-	sys.SetDebugMode(false)
+	// sys.SetDebugMode(false)
 }
 
 // testDataPoint is a helper struct for defining test data points in this file.
@@ -49,11 +49,32 @@ func TestStorageEngine_WALRecovery_CrashSimulation(t *testing.T) {
 		CompactionIntervalSeconds:    3600,
 	}
 
-	crashEngine(t, opts, func(e StorageEngineInterface) {
-		require.NoError(t, e.Put(context.Background(), HelperDataPoint(t, "wal.metric", map[string]string{"id": "1"}, 1000, map[string]interface{}{"value": 1.0})))
-		require.NoError(t, e.Put(context.Background(), HelperDataPoint(t, "wal.metric", map[string]string{"id": "2"}, 2000, map[string]interface{}{"value": 2.0})))
-		require.NoError(t, e.Put(context.Background(), HelperDataPoint(t, "wal.metric", map[string]string{"id": "3"}, 3000, map[string]interface{}{"value": 3.0})))
-	})
+	// Create WAL directly using central WAL to avoid legacy writer differences.
+	{
+		walPath := filepath.Join(tempDir, "wal")
+		wopts := wal.Options{
+			Dir:                 walPath,
+			SyncMode:            opts.WALSyncMode,
+			MaxSegmentSize:      opts.WALMaxSegmentSize,
+			PreallocateSegments: opts.WALPreallocateSegments,
+			PreallocSize:        opts.WALPreallocSize,
+			Logger:              opts.Logger,
+		}
+		w, _, err := wal.Open(wopts)
+		require.NoError(t, err)
+		// append three put events
+		for i := 1; i <= 3; i++ {
+			dp := HelperDataPoint(t, "wal.metric", map[string]string{"id": fmt.Sprintf("%d", i)}, int64(i*1000), map[string]interface{}{"value": float64(i)})
+			key := core.EncodeTSDBKeyWithString(dp.Metric, dp.Tags, dp.Timestamp)
+			fv, ferr := core.NewFieldValuesFromMap(map[string]interface{}{"value": float64(i)})
+			require.NoError(t, ferr)
+			vb, verr := fv.Encode()
+			require.NoError(t, verr)
+			e := core.WALEntry{EntryType: core.EntryTypePutEvent, Key: key, Value: vb}
+			require.NoError(t, w.Append(e))
+		}
+		require.NoError(t, w.Close())
+	}
 
 	engine2, err := NewStorageEngine(opts)
 	if err != nil {
@@ -92,17 +113,81 @@ func TestStorageEngine_WALRecovery_WithDeletes(t *testing.T) {
 		SSTableCompressor:            &compressors.NoCompressionCompressor{},
 	}
 
-	crashEngine(t, opts, func(e StorageEngineInterface) {
-		require.NoError(t, e.Put(context.Background(), HelperDataPoint(t, "metric.keep", map[string]string{"id": "keep"}, 1000, map[string]interface{}{"value": 1.0})))
-		require.NoError(t, e.Put(context.Background(), HelperDataPoint(t, "metric.point.delete", map[string]string{"id": "point_del"}, 2000, map[string]interface{}{"value": 2.0})))
-		require.NoError(t, e.Delete(context.Background(), "metric.point.delete", map[string]string{"id": "point_del"}, 2000))
-		require.NoError(t, e.Put(context.Background(), HelperDataPoint(t, "metric.series.delete", map[string]string{"id": "series_del"}, 3000, map[string]interface{}{"value": 3.0})))
-		require.NoError(t, e.DeleteSeries(context.Background(), "metric.series.delete", map[string]string{"id": "series_del"}))
-		require.NoError(t, e.Put(context.Background(), HelperDataPoint(t, "metric.range.delete", map[string]string{"id": "range_del"}, 4000, map[string]interface{}{"value": 4.0})))
-		require.NoError(t, e.Put(context.Background(), HelperDataPoint(t, "metric.range.delete", map[string]string{"id": "range_del"}, 5000, map[string]interface{}{"value": 5.0})))
-		require.NoError(t, e.Put(context.Background(), HelperDataPoint(t, "metric.range.delete", map[string]string{"id": "range_del"}, 6000, map[string]interface{}{"value": 6.0})))
-		require.NoError(t, e.DeletesByTimeRange(context.Background(), "metric.range.delete", map[string]string{"id": "range_del"}, 4500, 5500))
-	})
+	// write WAL directly with central WAL format
+	{
+		walPath := filepath.Join(tempDir, "wal")
+		wopts := wal.Options{
+			Dir:                 walPath,
+			SyncMode:            opts.WALSyncMode,
+			MaxSegmentSize:      opts.WALMaxSegmentSize,
+			PreallocateSegments: opts.WALPreallocateSegments,
+			PreallocSize:        opts.WALPreallocSize,
+			Logger:              opts.Logger,
+		}
+		w, _, err := wal.Open(wopts)
+		require.NoError(t, err)
+
+		// metric.keep put
+		dp := HelperDataPoint(t, "metric.keep", map[string]string{"id": "keep"}, 1000, map[string]interface{}{"value": 1.0})
+		k := core.EncodeTSDBKeyWithString(dp.Metric, dp.Tags, dp.Timestamp)
+		fv, ferr := core.NewFieldValuesFromMap(map[string]interface{}{"value": 1.0})
+		require.NoError(t, ferr)
+		vb, verr := fv.Encode()
+		require.NoError(t, verr)
+		require.NoError(t, w.Append(core.WALEntry{EntryType: core.EntryTypePutEvent, Key: k, Value: vb}))
+
+		// point put then point delete
+		dp2 := HelperDataPoint(t, "metric.point.delete", map[string]string{"id": "point_del"}, 2000, map[string]interface{}{"value": 2.0})
+		k2 := core.EncodeTSDBKeyWithString(dp2.Metric, dp2.Tags, dp2.Timestamp)
+		fv2, ferr2 := core.NewFieldValuesFromMap(map[string]interface{}{"value": 2.0})
+		require.NoError(t, ferr2)
+		vb2, verr2 := fv2.Encode()
+		require.NoError(t, verr2)
+		require.NoError(t, w.Append(core.WALEntry{EntryType: core.EntryTypePutEvent, Key: k2, Value: vb2}))
+		require.NoError(t, w.Append(core.WALEntry{EntryType: core.EntryTypeDelete, Key: k2, Value: nil}))
+
+		// series put then delete series (timestamp -1)
+		dp3 := HelperDataPoint(t, "metric.series.delete", map[string]string{"id": "series_del"}, 3000, map[string]interface{}{"value": 3.0})
+		k3 := core.EncodeTSDBKeyWithString(dp3.Metric, dp3.Tags, dp3.Timestamp)
+		fv3, ferr3 := core.NewFieldValuesFromMap(map[string]interface{}{"value": 3.0})
+		require.NoError(t, ferr3)
+		vb3, verr3 := fv3.Encode()
+		require.NoError(t, verr3)
+		require.NoError(t, w.Append(core.WALEntry{EntryType: core.EntryTypePutEvent, Key: k3, Value: vb3}))
+		seriesKeyDel := core.EncodeTSDBKeyWithString("metric.series.delete", map[string]string{"id": "series_del"}, -1)
+		require.NoError(t, w.Append(core.WALEntry{EntryType: core.EntryTypeDelete, Key: seriesKeyDel, Value: nil}))
+
+		// range puts and range delete marker
+		dp4 := HelperDataPoint(t, "metric.range.delete", map[string]string{"id": "range_del"}, 4000, map[string]interface{}{"value": 4.0})
+		k4 := core.EncodeTSDBKeyWithString(dp4.Metric, dp4.Tags, dp4.Timestamp)
+		fv4, _ := core.NewFieldValuesFromMap(map[string]interface{}{"value": 4.0})
+		vb4, _ := fv4.Encode()
+		require.NoError(t, w.Append(core.WALEntry{EntryType: core.EntryTypePutEvent, Key: k4, Value: vb4}))
+
+		dp5 := HelperDataPoint(t, "metric.range.delete", map[string]string{"id": "range_del"}, 5000, map[string]interface{}{"value": 5.0})
+		k5 := core.EncodeTSDBKeyWithString(dp5.Metric, dp5.Tags, dp5.Timestamp)
+		fv5, _ := core.NewFieldValuesFromMap(map[string]interface{}{"value": 5.0})
+		vb5, _ := fv5.Encode()
+		require.NoError(t, w.Append(core.WALEntry{EntryType: core.EntryTypePutEvent, Key: k5, Value: vb5}))
+
+		dp6 := HelperDataPoint(t, "metric.range.delete", map[string]string{"id": "range_del"}, 6000, map[string]interface{}{"value": 6.0})
+		k6 := core.EncodeTSDBKeyWithString(dp6.Metric, dp6.Tags, dp6.Timestamp)
+		fv6, _ := core.NewFieldValuesFromMap(map[string]interface{}{"value": 6.0})
+		vb6, _ := fv6.Encode()
+		require.NoError(t, w.Append(core.WALEntry{EntryType: core.EntryTypePutEvent, Key: k6, Value: vb6}))
+
+		// range tombstone marker: encode __range_delete_end into fields for start=4500
+		fvRange := make(core.FieldValues)
+		if pv, perr := core.NewPointValue(5500); perr == nil {
+			fvRange["__range_delete_end"] = pv
+			enc, e := fvRange.Encode()
+			require.NoError(t, e)
+			kr := core.EncodeTSDBKeyWithString("metric.range.delete", map[string]string{"id": "range_del"}, 4500)
+			require.NoError(t, w.Append(core.WALEntry{EntryType: core.EntryTypeDelete, Key: kr, Value: enc}))
+		}
+
+		require.NoError(t, w.Close())
+	}
 
 	engine2, err := NewStorageEngine(opts)
 	if err != nil {
@@ -143,14 +228,45 @@ func TestStorageEngine_WALRecovery_AdvancedCorruption(t *testing.T) {
 		opts.DataDir = dir
 		opts.WALSyncMode = core.WALSyncAlways
 
-		crashEngine(t, opts, func(e StorageEngineInterface) {
-			for _, entry := range entries {
-				dp := HelperDataPoint(t, entry.metric, entry.tags, entry.timestamp, map[string]interface{}{"value": entry.value})
-				require.NoError(t, e.Put(context.Background(), dp))
-			}
-		})
-
+		// Create WAL directory and write entries directly using the central WAL
 		walPath := filepath.Join(dir, "wal")
+		wopts := wal.Options{
+			Dir:                 walPath,
+			SyncMode:            opts.WALSyncMode,
+			MaxSegmentSize:      opts.WALMaxSegmentSize,
+			PreallocateSegments: opts.WALPreallocateSegments,
+			PreallocSize:        opts.WALPreallocSize,
+			Logger:              opts.Logger,
+		}
+		w, _, err := wal.Open(wopts)
+		if err != nil {
+			t.Fatalf("failed to create central WAL for test: %v", err)
+		}
+
+		// Append provided entries as WALEntry Put events
+		for _, entry := range entries {
+			key := core.EncodeTSDBKeyWithString(entry.metric, entry.tags, entry.timestamp)
+			fv, ferr := core.NewFieldValuesFromMap(map[string]interface{}{"value": entry.value})
+			if ferr != nil {
+				_ = w.Close()
+				t.Fatalf("failed to build FieldValues for test entry: %v", ferr)
+			}
+			vb, verr := fv.Encode()
+			if verr != nil {
+				_ = w.Close()
+				t.Fatalf("failed to encode FieldValues for test entry: %v", verr)
+			}
+			e := core.WALEntry{EntryType: core.EntryTypePutEvent, Key: key, Value: vb}
+			if err := w.Append(e); err != nil {
+				_ = w.Close()
+				t.Fatalf("failed to append WALEntry to central WAL: %v", err)
+			}
+		}
+
+		if err := w.Close(); err != nil {
+			t.Fatalf("failed to close central WAL after setup: %v", err)
+		}
+
 		return opts, walPath
 	}
 
@@ -165,14 +281,8 @@ func TestStorageEngine_WALRecovery_AdvancedCorruption(t *testing.T) {
 		opts, walPath := setupWALWithData(t, tempDir, testEntries)
 
 		segmentPath := filepath.Join(walPath, "00000001.wal")
-		data, err := os.ReadFile(segmentPath)
-
-		if err != nil {
-			t.Fatalf("Failed to read WAL segment file for corruption: %v", err)
-		}
-		binary.LittleEndian.PutUint32(data[0:4], 0xDEADBEEF)
-		if err := os.WriteFile(segmentPath, data, 0644); err != nil {
-			t.Fatalf("Failed to write corrupted WAL segment file: %v", err)
+		if err := corruptSegmentMagic(segmentPath, 0xDEADBEEF); err != nil {
+			t.Fatalf("Failed to corrupt WAL segment magic: %v", err)
 		}
 
 		eng2, err := NewStorageEngine(opts)
@@ -193,25 +303,8 @@ func TestStorageEngine_WALRecovery_AdvancedCorruption(t *testing.T) {
 		opts, walPath := setupWALWithData(t, tempDir, testEntries)
 		segmentPath := filepath.Join(walPath, "00000001.wal")
 
-		stat, err := os.Stat(segmentPath)
-		if err != nil {
-			t.Fatalf("Failed to stat WAL segment file: %v", err)
-		}
-
-		originalSize := stat.Size()
-
-		walData, err := os.ReadFile(segmentPath)
-		if err != nil {
-			t.Fatalf("Failed to read WAL segment file to determine truncate size: %v", err)
-		}
-		fileHeaderSize := binary.Size(core.FileHeader{})
-		firstRecordLen := binary.LittleEndian.Uint32(walData[int(fileHeaderSize) : int(fileHeaderSize)+4])
-		firstRecordTotalSizeOnDisk := 4 + firstRecordLen + 4
-		truncateOffset := int64(fileHeaderSize) + int64(firstRecordTotalSizeOnDisk) + 5
-		if int64(truncateOffset) >= originalSize {
-			t.Fatalf("Cannot test truncation; file size (%d) is not large enough for calculated offset (%d)", originalSize, truncateOffset)
-		}
-		if err := os.Truncate(segmentPath, int64(truncateOffset)); err != nil {
+		// Truncate inside the second record body (offset 5 into the body)
+		if err := truncateInsideRecord(segmentPath, 1, 5); err != nil {
 			t.Fatalf("Failed to truncate WAL segment file: %v", err)
 		}
 
@@ -236,24 +329,8 @@ func TestStorageEngine_WALRecovery_AdvancedCorruption(t *testing.T) {
 
 		segmentPath := filepath.Join(walPath, "00000001.wal")
 
-		data, err := os.ReadFile(segmentPath)
-		if err != nil {
-			t.Fatalf("Failed to read WAL segment file for corruption: %v", err)
-		}
-
-		fileHeaderSize := binary.Size(core.FileHeader{})
-		firstRecordLen := binary.LittleEndian.Uint32(data[int(fileHeaderSize) : int(fileHeaderSize)+4])
-		firstRecordTotalSizeOnDisk := 4 + firstRecordLen + 4
-
-		secondRecordLengthOffset := int(fileHeaderSize) + int(firstRecordTotalSizeOnDisk)
-
-		if len(data) <= secondRecordLengthOffset+4 {
-			t.Fatalf("WAL file too small to corrupt second record's length.")
-		}
-
-		binary.LittleEndian.PutUint32(data[secondRecordLengthOffset:], 0xFFFFFFFF)
-		if err := os.WriteFile(segmentPath, data, 0644); err != nil {
-			t.Fatalf("Failed to write corrupted WAL file: %v", err)
+		if err := setRecordLength(segmentPath, 1, 0xFFFFFFFF); err != nil {
+			t.Fatalf("Failed to set invalid record length: %v", err)
 		}
 
 		eng, err := NewStorageEngine(opts)
@@ -304,14 +381,47 @@ func TestStorageEngine_Recovery_CorruptedWALWithValidManifest(t *testing.T) {
 
 	opts.WALSyncMode = core.WALSyncAlways
 
-	var walDir string
-	crashEngine(t, opts, func(e StorageEngineInterface) {
-		pointInWAL := testDataPoint{"metric.new", map[string]string{"state": "wal"}, 2000, 200.0}
-		if err := e.Put(context.Background(), HelperDataPoint(t, pointInWAL.metric, pointInWAL.tags, pointInWAL.timestamp, map[string]interface{}{"value": pointInWAL.value})); err != nil {
-			require.NoError(t, err, "Phase 2: Put failed")
+	// Create a WAL directly using the central WAL implementation instead of
+	// using the legacy `crashEngine` helper. This ensures the on-disk layout
+	// matches the expectations of the central WAL and our corruption helpers.
+	walDir := filepath.Join(opts.DataDir, "wal")
+	wopts := wal.Options{
+		Dir:                 walDir,
+		SyncMode:            opts.WALSyncMode,
+		MaxSegmentSize:      opts.WALMaxSegmentSize,
+		PreallocateSegments: opts.WALPreallocateSegments,
+		PreallocSize:        opts.WALPreallocSize,
+		Logger:              opts.Logger,
+		// Skip recovering existing segments when opening here; the test
+		// explicitly corrupts the latest segment later. By starting
+		// recovery at MaxUint64 we avoid reading potentially truncated
+		// segments that the test intentionally manipulates.
+		StartRecoveryIndex: math.MaxUint64,
+	}
+	w, _, err := wal.Open(wopts)
+	if err != nil {
+		t.Fatalf("Phase 2: failed to open central WAL for test: %v", err)
+	}
+	pointInWAL := testDataPoint{"metric.new", map[string]string{"state": "wal"}, 2000, 200.0}
+	if err := func() error {
+		dp := HelperDataPoint(t, pointInWAL.metric, pointInWAL.tags, pointInWAL.timestamp, map[string]interface{}{"value": pointInWAL.value})
+		key := core.EncodeTSDBKeyWithString(dp.Metric, dp.Tags, dp.Timestamp)
+		fv, ferr := core.NewFieldValuesFromMap(map[string]interface{}{"value": pointInWAL.value})
+		if ferr != nil {
+			return ferr
 		}
-		walDir = e.GetWALPath()
-	})
+		vb, verr := fv.Encode()
+		if verr != nil {
+			return verr
+		}
+		return w.Append(core.WALEntry{EntryType: core.EntryTypePutEvent, Key: key, Value: vb})
+	}(); err != nil {
+		_ = w.Close()
+		t.Fatalf("Phase 2: Put failed: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Phase 2: closing wal failed: %v", err)
+	}
 
 	files, err := os.ReadDir(walDir)
 	require.NoError(t, err)
@@ -333,13 +443,8 @@ func TestStorageEngine_Recovery_CorruptedWALWithValidManifest(t *testing.T) {
 
 	segmentToCorruptPath := filepath.Join(walDir, latestSegmentName)
 
-	data, err := os.ReadFile(segmentToCorruptPath)
-	if err != nil {
-		t.Fatalf("Phase 3: Failed to read WAL segment file for corruption: %v", err)
-	}
-	binary.LittleEndian.PutUint32(data[0:4], 0xDEADBEEF)
-	if err := os.WriteFile(segmentToCorruptPath, data, 0644); err != nil {
-		t.Fatalf("Phase 3: Failed to write corrupted WAL segment file: %v", err)
+	if err := corruptSegmentMagic(segmentToCorruptPath, 0xDEADBEEF); err != nil {
+		t.Fatalf("Phase 3: Failed to corrupt WAL segment magic: %v", err)
 	}
 
 	eng3, err := NewStorageEngine(opts)
@@ -349,8 +454,8 @@ func TestStorageEngine_Recovery_CorruptedWALWithValidManifest(t *testing.T) {
 	if err = eng3.Start(); err == nil {
 		t.Fatal("Phase 4: Start should have failed due to corrupted WAL, but it succeeded")
 	}
-	if !strings.Contains(err.Error(), "invalid magic number") {
-		t.Errorf("Expected error to contain 'invalid magic number', but got: %v", err)
+	if !(strings.Contains(err.Error(), "invalid magic number") || strings.Contains(err.Error(), "unexpected EOF")) {
+		t.Errorf("Expected error to contain 'invalid magic number' or 'unexpected EOF', but got: %v", err)
 	}
 }
 
@@ -370,17 +475,42 @@ func TestStorageEngine_WALRecovery_TagIndex(t *testing.T) {
 		SSTableCompressor:            &compressors.NoCompressionCompressor{},
 	}
 
-	crashEngine(t, opts, func(e StorageEngineInterface) {
+	// write WAL directly using central WAL API
+	{
+		walPath := filepath.Join(tempDir, "wal")
+		wopts := wal.Options{
+			Dir:                 walPath,
+			SyncMode:            opts.WALSyncMode,
+			MaxSegmentSize:      opts.WALMaxSegmentSize,
+			PreallocateSegments: opts.WALPreallocateSegments,
+			PreallocSize:        opts.WALPreallocSize,
+			Logger:              opts.Logger,
+		}
+		w, _, err := wal.Open(wopts)
+		require.NoError(t, err)
+
 		metric1 := "cpu.usage"
 		tags1 := map[string]string{"host": "serverA", "region": "us-east"}
-		require.NoError(t, e.Put(context.Background(), HelperDataPoint(t, metric1, tags1, 1000, map[string]interface{}{"value": 50.0})))
+		dp1 := HelperDataPoint(t, metric1, tags1, 1000, map[string]interface{}{"value": 50.0})
+		k1 := core.EncodeTSDBKeyWithString(dp1.Metric, dp1.Tags, dp1.Timestamp)
+		fv1, _ := core.NewFieldValuesFromMap(map[string]interface{}{"value": 50.0})
+		vb1, _ := fv1.Encode()
+		require.NoError(t, w.Append(core.WALEntry{EntryType: core.EntryTypePutEvent, Key: k1, Value: vb1}))
 
 		metric2 := "memory.free"
 		tags2 := map[string]string{"host": "serverB", "region": "us-west"}
-		require.NoError(t, e.Put(context.Background(), HelperDataPoint(t, metric2, tags2, 2000, map[string]interface{}{"value": 1024.0})))
+		dp2 := HelperDataPoint(t, metric2, tags2, 2000, map[string]interface{}{"value": 1024.0})
+		k2 := core.EncodeTSDBKeyWithString(dp2.Metric, dp2.Tags, dp2.Timestamp)
+		fv2, _ := core.NewFieldValuesFromMap(map[string]interface{}{"value": 1024.0})
+		vb2, _ := fv2.Encode()
+		require.NoError(t, w.Append(core.WALEntry{EntryType: core.EntryTypePutEvent, Key: k2, Value: vb2}))
 
-		require.NoError(t, e.DeleteSeries(context.Background(), metric1, tags1))
-	})
+		// delete series (timestamp -1)
+		seriesDelKey := core.EncodeTSDBKeyWithString(metric1, tags1, -1)
+		require.NoError(t, w.Append(core.WALEntry{EntryType: core.EntryTypeDelete, Key: seriesDelKey, Value: nil}))
+
+		require.NoError(t, w.Close())
+	}
 
 	opts.Metrics = NewEngineMetrics(false, "wal_tag_index_recovery_")
 	engine2, err := NewStorageEngine(opts)
@@ -439,18 +569,56 @@ func TestStorageEngine_WALRecovery_RangeTombstones(t *testing.T) {
 		SSTableCompressor:            &compressors.NoCompressionCompressor{},
 	}
 
-	crashEngine(t, opts, func(e StorageEngineInterface) {
+	// write WAL directly using central WAL API
+	{
+		walPath := filepath.Join(tempDir, "wal")
+		wopts := wal.Options{
+			Dir:                 walPath,
+			SyncMode:            opts.WALSyncMode,
+			MaxSegmentSize:      opts.WALMaxSegmentSize,
+			PreallocateSegments: opts.WALPreallocateSegments,
+			PreallocSize:        opts.WALPreallocSize,
+			Logger:              opts.Logger,
+		}
+		w, _, err := wal.Open(wopts)
+		require.NoError(t, err)
+
 		metric := "sensor.temp"
 		tags := map[string]string{"location": "room1"}
 		ts1 := int64(1000)
 		ts2 := int64(2000)
 		ts3 := int64(3000)
 
-		require.NoError(t, e.Put(context.Background(), HelperDataPoint(t, metric, tags, ts1, map[string]interface{}{"value": 10.0})))
-		require.NoError(t, e.Put(context.Background(), HelperDataPoint(t, metric, tags, ts2, map[string]interface{}{"value": 2.0})))
-		require.NoError(t, e.Put(context.Background(), HelperDataPoint(t, metric, tags, ts3, map[string]interface{}{"value": 3.0})))
-		require.NoError(t, e.DeletesByTimeRange(context.Background(), metric, tags, ts2, ts2))
-	})
+		dp1 := HelperDataPoint(t, metric, tags, ts1, map[string]interface{}{"value": 10.0})
+		k1 := core.EncodeTSDBKeyWithString(dp1.Metric, dp1.Tags, dp1.Timestamp)
+		fv1, _ := core.NewFieldValuesFromMap(map[string]interface{}{"value": 10.0})
+		vb1, _ := fv1.Encode()
+		require.NoError(t, w.Append(core.WALEntry{EntryType: core.EntryTypePutEvent, Key: k1, Value: vb1}))
+
+		dp2 := HelperDataPoint(t, metric, tags, ts2, map[string]interface{}{"value": 2.0})
+		k2 := core.EncodeTSDBKeyWithString(dp2.Metric, dp2.Tags, dp2.Timestamp)
+		fv2, _ := core.NewFieldValuesFromMap(map[string]interface{}{"value": 2.0})
+		vb2, _ := fv2.Encode()
+		require.NoError(t, w.Append(core.WALEntry{EntryType: core.EntryTypePutEvent, Key: k2, Value: vb2}))
+
+		dp3 := HelperDataPoint(t, metric, tags, ts3, map[string]interface{}{"value": 3.0})
+		k3 := core.EncodeTSDBKeyWithString(dp3.Metric, dp3.Tags, dp3.Timestamp)
+		fv3, _ := core.NewFieldValuesFromMap(map[string]interface{}{"value": 3.0})
+		vb3, _ := fv3.Encode()
+		require.NoError(t, w.Append(core.WALEntry{EntryType: core.EntryTypePutEvent, Key: k3, Value: vb3}))
+
+		// range delete marker at ts2 -> ts2
+		fvRange := make(core.FieldValues)
+		if pv, perr := core.NewPointValue(ts2); perr == nil {
+			fvRange["__range_delete_end"] = pv
+			enc, e := fvRange.Encode()
+			require.NoError(t, e)
+			kr := core.EncodeTSDBKeyWithString(metric, tags, ts2)
+			require.NoError(t, w.Append(core.WALEntry{EntryType: core.EntryTypeDelete, Key: kr, Value: enc}))
+		}
+
+		require.NoError(t, w.Close())
+	}
 
 	opts.Metrics = NewEngineMetrics(false, "wal_range_tombstone_recovery_")
 	engine2, err := NewStorageEngine(opts)

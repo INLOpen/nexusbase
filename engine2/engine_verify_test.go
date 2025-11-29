@@ -25,19 +25,45 @@ func TestStorageEngine_VerifyDataConsistency_Port(t *testing.T) {
 		opts.DataDir = tempDir
 		opts.ErrorOnSSTableLoadFailure = false
 
-		// Create an engine, write some data and close to generate an SSTable
-		setupOpts := opts
-		setupOpts.CompactionIntervalSeconds = 3600
-		eng, err := NewStorageEngine(setupOpts)
-		require.NoError(t, err)
-		require.NoError(t, eng.Start())
+		// Create an SSTable directly to avoid relying on the engine WAL for
+		// this focused index verification test. Writing the SSTable directly
+		// eliminates WAL recovery from the equation and keeps the test
+		// deterministic.
+		sstDir := filepath.Join(tempDir, "sst")
+		require.NoError(t, os.MkdirAll(sstDir, 0o755))
 
-		eng.Put(context.Background(), HelperDataPoint(t, "corrupt.metric", map[string]string{"id": "1"}, 100, map[string]interface{}{"value": 1.0}))
-		eng.Put(context.Background(), HelperDataPoint(t, "corrupt.metric", map[string]string{"id": "2"}, 200, map[string]interface{}{"value": 2.0}))
-		require.NoError(t, eng.Close())
+		id := uint64(time.Now().UnixNano())
+		writerOpts := core.SSTableWriterOptions{
+			DataDir:                      sstDir,
+			ID:                           id,
+			EstimatedKeys:                2,
+			BloomFilterFalsePositiveRate: 0.01,
+			BlockSize:                    32 * 1024,
+			Compressor:                   &compressors.NoCompressionCompressor{},
+			Logger:                       nil,
+		}
+		writer, werr := sstable.NewSSTableWriter(writerOpts)
+		require.NoError(t, werr)
+		// add two keys to establish min/max range
+		require.NoError(t, writer.Add([]byte("a"), []byte("v1"), core.EntryTypePutEvent, 0))
+		require.NoError(t, writer.Add([]byte("b"), []byte("v2"), core.EntryTypePutEvent, 0))
+		require.NoError(t, writer.Finish())
+
+		// Append manifest entry so engine startup can discover this SSTable
+		manifestPath := filepath.Join(opts.DataDir, "sstables", "manifest.json")
+		if err := os.MkdirAll(filepath.Dir(manifestPath), 0o755); err != nil {
+			t.Fatalf("failed to create manifest directory: %v", err)
+		}
+		base := filepath.Base(writer.FilePath())
+		base = strings.TrimSuffix(base, filepath.Ext(base))
+		wid, perr := strconv.ParseUint(base, 10, 64)
+		if perr != nil {
+			t.Fatalf("failed to parse sstable id from filename %s: %v", base, perr)
+		}
+		entry := SSTableManifestEntry{ID: wid, FilePath: writer.FilePath(), KeyCount: uint64(2), CreatedAt: time.Now().UTC()}
+		require.NoError(t, AppendManifestEntry(manifestPath, entry))
 
 		// Find created SSTable file
-		sstDir := filepath.Join(tempDir, "sst")
 		files, err := os.ReadDir(sstDir)
 		require.NoError(t, err)
 		require.NotEmpty(t, files)

@@ -53,14 +53,13 @@ func TestStorageEngine_VerifyDataConsistency_Extra(t *testing.T) {
 		require.NoError(t, setupEngine.Put(context.Background(), HelperDataPoint(t, "minmax.test", map[string]string{"id": "b"}, 2, map[string]interface{}{"value": 2.0})))
 		require.NoError(t, setupEngine.Close())
 
-		// Remove auxiliary files leaving .sst so fallback startup uses sstables only
-		files, err := os.ReadDir(engineDir)
-		require.NoError(t, err)
-		for _, file := range files {
-			if !file.IsDir() {
-				_ = sys.Remove(filepath.Join(engineDir, file.Name()))
-			}
-		}
+		// Remove the WAL directory and other auxiliary files so engine startup
+		// falls back to loading SSTables from disk only. Some test environments
+		// may have leftover WAL state that interferes with this focused test,
+		// so explicitly remove the `wal` directory.
+		_ = os.RemoveAll(filepath.Join(engineDir, "wal"))
+		_ = sys.Remove(filepath.Join(engineDir, "string_mapping.log"))
+		_ = sys.Remove(filepath.Join(engineDir, "series_mapping.log"))
 
 		eng, err := NewStorageEngine(opts)
 		require.NoError(t, err)

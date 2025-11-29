@@ -25,6 +25,10 @@ func TestAdapterFlushWritesReadableIndex(t *testing.T) {
 		t.Fatalf("NewStorageEngine: %v", err)
 	}
 	a := ai.(*Engine2Adapter)
+	if err := a.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer a.Close()
 
 	// Put a few data points with non-empty FieldValues so chunk payloads are written
 	basePts := []struct {

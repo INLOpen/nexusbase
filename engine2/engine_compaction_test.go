@@ -27,7 +27,7 @@ import (
 var errMockRemove = fmt.Errorf("simulated os.Remove error")
 
 func init() {
-	sys.SetDebugMode(false)
+	// sys.SetDebugMode(false)
 }
 
 // MockSSTableWriter for testing CompactionManager error handling

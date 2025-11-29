@@ -600,7 +600,12 @@ func (tim *TagIndexManager) compactIndexLevelNToLevelNPlus1(levelN int) error {
 
 	// Cleanup old files
 	for _, oldTable := range inputTables {
-		oldTable.Close()
+		if err := oldTable.Close(); err != nil {
+			// Ignore benign already-closed sentinel; otherwise log the error.
+			if err != sstable.ErrClosed {
+				tim.logger.Error("Failed to close old index sstable after LN compaction", "path", oldTable.FilePath(), "error", err)
+			}
+		}
 		if err := sys.Remove(oldTable.FilePath()); err != nil {
 			tim.logger.Error("Failed to remove old index sstable after LN compaction", "path", oldTable.FilePath(), "error", err)
 		}
@@ -649,7 +654,11 @@ func (tim *TagIndexManager) compactIndexL0ToL1() error {
 
 	// Cleanup old L0 files.
 	for _, oldTable := range l0Tables {
-		oldTable.Close()
+		if err := oldTable.Close(); err != nil {
+			if err != sstable.ErrClosed {
+				tim.logger.Error("Failed to close old index L0 sstable", "path", oldTable.FilePath(), "error", err)
+			}
+		}
 		if err := sys.Remove(oldTable.FilePath()); err != nil {
 			tim.logger.Error("Failed to remove old index L0 sstable", "path", oldTable.FilePath(), "error", err)
 		}
@@ -1152,7 +1161,9 @@ func (tim *TagIndexManager) LoadFromFile(dataDir string) error {
 			}
 			if err := tim.levelsManager.AddTableToLevel(levelManifest.LevelNumber, table); err != nil {
 				tim.logger.Error("Failed to add loaded index SSTable to level from manifest, skipping.", "id", table.ID(), "level", levelManifest.LevelNumber, "error", err)
-				table.Close() // Close the table if we can't add it.
+				if cerr := table.Close(); cerr != nil && cerr != sstable.ErrClosed {
+					tim.logger.Error("Failed to close index SSTable after add-to-level failure", "id", table.ID(), "error", cerr)
+				}
 			}
 		}
 	}

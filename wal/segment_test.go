@@ -275,3 +275,27 @@ func TestReadRecord_WALMaxSegmentSize(t *testing.T) {
 		require.NoError(t, err) // Should not error, as it's exactly at the limit
 	})
 }
+
+func TestCreateSegment_Preallocate(t *testing.T) {
+	tempDir := t.TempDir()
+
+	prealloc := int64(4096)
+
+	sw, err := CreateSegment(tempDir, 1, 64*1024, prealloc)
+	require.NoError(t, err)
+	defer sw.Close()
+
+	// File should exist
+	_, err = os.Stat(sw.path)
+	require.NoError(t, err)
+
+	// Check the on-disk size. Preallocation is best-effort; it may leave the
+	// file at just the header size or expand it to the requested prealloc size.
+	// Accept any size between header size and the requested prealloc size.
+	actualSize, err := sw.Segment.Size()
+	require.NoError(t, err)
+
+	headerSize := int64(binary.Size(core.FileHeader{}))
+	assert.GreaterOrEqual(t, actualSize, headerSize)
+	assert.LessOrEqual(t, actualSize, prealloc)
+}

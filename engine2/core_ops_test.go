@@ -15,6 +15,9 @@ func TestPutGetReplayForceFlush(t *testing.T) {
 		t.Fatalf("NewStorageEngine failed: %v", err)
 	}
 	adapter := ai.(*Engine2Adapter)
+	if errStart := adapter.Start(); errStart != nil {
+		t.Fatalf("Start failed: %v", errStart)
+	}
 	defer adapter.Close()
 
 	fv, _ := core.NewFieldValuesFromMap(map[string]interface{}{"v": 42})
@@ -44,6 +47,9 @@ func TestPutGetReplayForceFlush(t *testing.T) {
 		t.Fatalf("NewStorageEngine reload failed: %v", err)
 	}
 	adapter2 := ai2.(*Engine2Adapter)
+	if errStart := adapter2.Start(); errStart != nil {
+		t.Fatalf("Start failed: %v", errStart)
+	}
 	defer adapter2.Close()
 
 	got2, err := adapter2.Get(context.Background(), "m1", map[string]string{"k": "v"}, 1000)

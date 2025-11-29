@@ -1,6 +1,7 @@
 package engine2
 
 import (
+	"context"
 	"log/slog"
 	"testing"
 
@@ -21,7 +22,7 @@ func NewStorageEngine(opts StorageEngineOptions) (StorageEngineInterface, error)
 	// Construct an engine2-backed storage engine and adapt it to the
 	// repository StorageEngineInterface so callers get an engine2-backed
 	// StorageEngine with minimal changes to their callsites.
-	e, err := NewEngine2(opts)
+	e, err := NewEngine2(context.Background(), opts)
 	if err != nil {
 		return nil, err
 	}
@@ -35,6 +36,11 @@ func NewStorageEngine(opts StorageEngineOptions) (StorageEngineInterface, error)
 	}
 	// Wrap Engine2 in the adapter which implements engine2.StorageEngineInterface
 	a := NewEngine2AdapterWithHooks(e, opts.HookManager)
+	// Note: do not auto-start the adapter here. Callers should invoke
+	// `Start()` explicitly when they want WAL replay and background
+	// managers to be initialized. Tests and callers that depended on the
+	// previous automatic-start behavior should be updated to call
+	// `Start()` manually.
 	if prevLogger != nil {
 		slog.SetDefault(prevLogger)
 	}
@@ -80,11 +86,28 @@ func GetActiveSeriesSnapshot(e StorageEngineExternal) ([]string, error) {
 // so engine2 tests don't need to import the legacy `engine` package.
 func GetBaseOptsForTest(t *testing.T, prefix string) StorageEngineOptions {
 	t.Helper()
+	// Allow opt-in persistent test dirs for easier debugging. If the
+	// environment variable `NEXUSBASE_PERSIST_TESTDIR` is set, use a
+	// persistent directory under that path instead of `t.TempDir()` so a
+	// developer can re-run a single failing test and inspect WAL/sstable
+	// files afterward. This only activates when the env var is present.
+	dataDir := t.TempDir()
+	/*
+		if base := os.Getenv("NEXUSBASE_PERSIST_TESTDIR"); base != "" {
+			// Create a path like <base>/<prefix><TestName>
+			persistent := filepath.Join(base, prefix+t.Name())
+			_ = os.MkdirAll(persistent, 0755)
+			dataDir = persistent
+		}
+	*/
+
+	// Note: sys debug mode is no longer enabled via environment variable.
+
 	// Provide minimal, sensible defaults used by engine2 tests. The full
 	// StorageEngineOptions type exists in `options.go` so tests can still set
 	// named fields if needed.
 	return StorageEngineOptions{
-		DataDir:                      t.TempDir(),
+		DataDir:                      dataDir,
 		MemtableThreshold:            1024 * 1024,
 		IndexMemtableThreshold:       1024 * 1024,
 		BlockCacheCapacity:           100,
@@ -96,8 +119,11 @@ func GetBaseOptsForTest(t *testing.T, prefix string) StorageEngineOptions {
 		SSTableDefaultBlockSize:      sstable.DefaultBlockSize,
 		SSTableCompressor:            &compressors.NoCompressionCompressor{},
 		WALSyncMode:                  core.WALSyncDisabled,
-		CompactionIntervalSeconds:    3600,
-		Metrics:                      NewEngineMetrics(false, prefix),
+		// Disable WAL preallocation in tests by default to avoid platform-
+		// specific prealloc behavior affecting small test segments.
+		WALPreallocateSegments:    func() *bool { b := false; return &b }(),
+		CompactionIntervalSeconds: 3600,
+		Metrics:                   NewEngineMetrics(false, prefix),
 	}
 }
 

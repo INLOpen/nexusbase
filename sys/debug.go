@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -55,9 +56,36 @@ func DOpenFile(sysFile File, name string, flag int, perm os.FileMode) (FileHandl
 func (df *DebugFile) Write(p []byte) (n int, err error) {
 	n, err = df.f.Write(p)
 	if err != nil {
-		df.logger.Debug("Write failed", "bytes", len(p), "n", n, "error", err)
+		// For WAL files, include a short hex dump to aid debugging.
+		name := df.f.Name()
+		if strings.Contains(name, string(os.PathSeparator)+"wal"+string(os.PathSeparator)) || strings.HasSuffix(name, ".wal") {
+			max := len(p)
+			if max > 64 {
+				max = 64
+			}
+			var sb strings.Builder
+			for i := 0; i < max; i++ {
+				fmt.Fprintf(&sb, "%02X ", p[i])
+			}
+			df.logger.Debug("Write failed", "bytes", len(p), "n", n, "error", err, "hex", sb.String())
+		} else {
+			df.logger.Debug("Write failed", "bytes", len(p), "n", n, "error", err)
+		}
 	} else {
-		df.logger.Debug("Write", "bytes", len(p), "n", n)
+		name := df.f.Name()
+		if strings.Contains(name, string(os.PathSeparator)+"wal"+string(os.PathSeparator)) || strings.HasSuffix(name, ".wal") {
+			max := len(p)
+			if max > 64 {
+				max = 64
+			}
+			var sb strings.Builder
+			for i := 0; i < max; i++ {
+				fmt.Fprintf(&sb, "%02X ", p[i])
+			}
+			df.logger.Debug("Write", "bytes", len(p), "n", n, "hex", sb.String())
+		} else {
+			df.logger.Debug("Write", "bytes", len(p), "n", n)
+		}
 	}
 	return n, err
 }
@@ -121,9 +149,35 @@ func (df *DebugFile) Name() string {
 func (df *DebugFile) WriteAt(p []byte, off int64) (n int, err error) {
 	n, err = df.f.WriteAt(p, off)
 	if err != nil {
-		df.logger.Debug("WriteAt failed", "bytes", len(p), "n", n, "off", off, "error", err)
+		name := df.f.Name()
+		if strings.Contains(name, string(os.PathSeparator)+"wal"+string(os.PathSeparator)) || strings.HasSuffix(name, ".wal") {
+			max := len(p)
+			if max > 64 {
+				max = 64
+			}
+			var sb strings.Builder
+			for i := 0; i < max; i++ {
+				fmt.Fprintf(&sb, "%02X ", p[i])
+			}
+			df.logger.Debug("WriteAt failed", "bytes", len(p), "n", n, "off", off, "error", err, "hex", sb.String())
+		} else {
+			df.logger.Debug("WriteAt failed", "bytes", len(p), "n", n, "off", off, "error", err)
+		}
 	} else {
-		df.logger.Debug("WriteAt", "bytes", len(p), "n", n, "off", off)
+		name := df.f.Name()
+		if strings.Contains(name, string(os.PathSeparator)+"wal"+string(os.PathSeparator)) || strings.HasSuffix(name, ".wal") {
+			max := len(p)
+			if max > 64 {
+				max = 64
+			}
+			var sb strings.Builder
+			for i := 0; i < max; i++ {
+				fmt.Fprintf(&sb, "%02X ", p[i])
+			}
+			df.logger.Debug("WriteAt", "bytes", len(p), "n", n, "off", off, "hex", sb.String())
+		} else {
+			df.logger.Debug("WriteAt", "bytes", len(p), "n", n, "off", off)
+		}
 	}
 	return n, err
 }

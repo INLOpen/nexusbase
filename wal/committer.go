@@ -52,6 +52,30 @@ func (w *WAL) commit(records []*commitRecord) {
 		return
 	}
 
+	// Assign sequence numbers to logical entries now so the on-disk records
+	// contain correct SeqNum values and stream readers observe monotonic
+	// sequences. This must be done before encoding the entries.
+	for i := range allEntries {
+		// If caller provided a SeqNum (non-zero), honor it and ensure the
+		// WAL sequence counter is advanced to at least that value so future
+		// assignments remain monotonic. Otherwise allocate the next seq.
+		if allEntries[i].SeqNum != 0 {
+			// Advance sequenceCounter to at least the provided value.
+			for {
+				cur := w.sequenceCounter.Load()
+				if cur >= allEntries[i].SeqNum {
+					break
+				}
+				if w.sequenceCounter.CompareAndSwap(cur, allEntries[i].SeqNum) {
+					break
+				}
+			}
+		} else {
+			newSeq := w.sequenceCounter.Add(1)
+			allEntries[i].SeqNum = newSeq
+		}
+	}
+
 	// Build encoded entries payloads (may split into multiple payloads if too large).
 	// We encode entries first without holding the WAL lock.
 	var encodedEntries [][]byte
@@ -170,7 +194,7 @@ func (w *WAL) commit(records []*commitRecord) {
 			finalErr = err
 			break
 		}
-		headerSize := int64(binary.Size(core.FileHeader{}))
+		headerSize := fileHeaderSize
 		if (currentSize+newRecordSize) > w.opts.MaxSegmentSize && currentSize > headerSize {
 			if err := w.rotateLocked(); err != nil {
 				w.mu.Unlock()
@@ -213,7 +237,7 @@ func (w *WAL) commit(records []*commitRecord) {
 		for i := 0; i < len(encodedEntryLists[pi]) && i < 8; i++ {
 			preview = append(preview, encodedEntryLists[pi][i].SeqNum)
 		}
-		slog.Default().Info("WAL: notifying streamers about payload", "payload_index", pi, "payload_buf_ptr", fmt.Sprintf("%p", payloadBufPtrs[pi]), "seq_preview", preview)
+		slog.Default().Debug("WAL: notifying streamers about payload", "payload_index", pi, "payload_buf_ptr", fmt.Sprintf("%p", payloadBufPtrs[pi]), "seq_preview", preview)
 		w.notifyStreamers(encodedEntryLists[pi])
 
 		// return payload buffer to pool (after notify)

@@ -32,6 +32,8 @@ import (
 
 	// For sstable.DefaultBlockSize and ErrNotFound
 
+	optsPackage "github.com/INLOpen/nexusbase/cmd/server/opts"
+	"github.com/INLOpen/nexusbase/levels"
 	"github.com/INLOpen/nexusbase/server" // Your gRPC server implementation
 )
 
@@ -129,6 +131,73 @@ func initTracerProvider(cfg config.TracingConfig, logger *slog.Logger) (*sdktrac
 	return tp, cleanup, nil
 }
 
+// buildEngineOptions maps the loaded configuration into engine2.StorageEngineOptions.
+// Extracted for testability.
+func buildEngineOptions(cfg *config.Config, hookManager hooks.HookManager, logger *slog.Logger, sstCompressor core.Compressor) engine2.StorageEngineOptions {
+	// Map compaction fallback strategy
+	compactionFallback := levels.PickOldest
+	switch strings.ToLower(cfg.Engine.Compaction.FallbackStrategy) {
+	case "picklargest", "largest":
+		compactionFallback = levels.PickLargest
+	case "picksmallest", "smallest":
+		compactionFallback = levels.PickSmallest
+	case "pickmostkeys", "mostkeys":
+		compactionFallback = levels.PickMostKeys
+	case "picksmallestavgkeysize", "smallestavgkeysize":
+		compactionFallback = levels.PickSmallestAvgKeySize
+	case "pickoldestbytimestamp", "oldestbytimestamp":
+		compactionFallback = levels.PickOldestByTimestamp
+	case "pickfewestkeys", "fewestkeys":
+		compactionFallback = levels.PickFewestKeys
+	case "pickrandom", "random":
+		compactionFallback = levels.PickRandom
+	case "picklargestavgkeysize", "largestavgkeysize":
+		compactionFallback = levels.PickLargestAvgKeySize
+	case "picknewest", "newest":
+		compactionFallback = levels.PickNewest
+	case "pickhighesttombstonedensity", "highesttombstonedensity":
+		compactionFallback = levels.PickHighestTombstoneDensity
+	default:
+		compactionFallback = levels.PickOldest
+	}
+
+	compactionIntervalSeconds := int(config.ParseDuration(cfg.Engine.Compaction.CheckInterval, 120*time.Second, logger).Seconds())
+
+	opts := engine2.StorageEngineOptions{
+		DataDir:                      cfg.Engine.DataDir,
+		HookManager:                  hookManager,
+		Logger:                       logger,
+		EnableSSTablePreallocate:     cfg.Engine.SSTable.Preallocate,
+		SSTablePreallocMultiplier:    cfg.Engine.SSTable.PreallocMultiplierBytesPerKey,
+		SSTableDefaultBlockSize:      int(cfg.Engine.SSTable.BlockSizeBytes),
+		BloomFilterFalsePositiveRate: cfg.Engine.SSTable.BloomFilterFPRate,
+		SSTableCompressor:            sstCompressor,
+		SSTableRestartPointInterval:  cfg.Engine.SSTable.RestartPointInterval,
+
+		// Index-related configuration mapped from config.Engine.Index
+		IndexMemtableThreshold:         cfg.Engine.Index.MemtableThreshold,
+		IndexFlushIntervalMs:           int(config.ParseDuration(cfg.Engine.Index.FlushInterval, 60*time.Second, logger).Milliseconds()),
+		IndexCompactionIntervalSeconds: int(config.ParseDuration(cfg.Engine.Index.CompactionCheckInterval, 20*time.Second, logger).Seconds()),
+		IndexMaxL0Files:                cfg.Engine.Index.L0TriggerFileCount,
+		IndexBaseTargetSize:            cfg.Engine.Index.BaseTargetSizeBytes,
+
+		// Global compaction and tuning options mapped from config.Engine.Compaction
+		L0CompactionTriggerSize:           cfg.Engine.Compaction.L0TriggerSizeBytes,
+		TargetSSTableSize:                 cfg.Engine.Compaction.TargetSSTableSizeBytes,
+		LevelsTargetSizeMultiplier:        cfg.Engine.Compaction.LevelsSizeMultiplier,
+		MaxLevels:                         cfg.Engine.Compaction.MaxLevels,
+		MaxL0Files:                        cfg.Engine.Compaction.L0TriggerFileCount,
+		CompactionTombstoneWeight:         cfg.Engine.Compaction.TombstoneWeight,
+		CompactionOverlapWeight:           cfg.Engine.Compaction.OverlapPenaltyWeight,
+		IntraL0CompactionTriggerFiles:     cfg.Engine.Compaction.IntraL0TriggerFileCount,
+		IntraL0CompactionMaxFileSizeBytes: cfg.Engine.Compaction.IntraL0MaxFileSizeBytes,
+		CompactionFallbackStrategy:        compactionFallback,
+		CompactionIntervalSeconds:         compactionIntervalSeconds,
+	}
+
+	return opts
+}
+
 func main() {
 	// Define a command-line flag for the config file path
 	configPath := flag.String("config", "config.yaml", "Path to the configuration file")
@@ -217,17 +286,10 @@ func main() {
 		sstCompressor = compressors.NewSnappyCompressor()
 	}
 
-	engAi, eng2Err := engine2.NewStorageEngine(engine2.StorageEngineOptions{
-		DataDir:                      cfg.Engine.DataDir,
-		HookManager:                  hookManager,
-		Logger:                       logger,
-		EnableSSTablePreallocate:     cfg.Engine.SSTable.Preallocate,
-		SSTablePreallocMultiplier:    cfg.Engine.SSTable.PreallocMultiplierBytesPerKey,
-		SSTableDefaultBlockSize:      int(cfg.Engine.SSTable.BlockSizeBytes),
-		BloomFilterFalsePositiveRate: cfg.Engine.SSTable.BloomFilterFPRate,
-		SSTableCompressor:            sstCompressor,
-		SSTableRestartPointInterval:  cfg.Engine.SSTable.RestartPointInterval,
-	})
+	// Build and log applied engine options for quick verification.
+	opts := optsPackage.BuildEngineOptions(cfg, hookManager, logger, sstCompressor)
+	logger.Info("Applying engine options", "data_dir", opts.DataDir, "l0_compaction_trigger_size", opts.L0CompactionTriggerSize, "target_sstable_size", opts.TargetSSTableSize, "compaction_interval_seconds", opts.CompactionIntervalSeconds, "compaction_fallback", opts.CompactionFallbackStrategy, "index_compaction_interval_seconds", opts.IndexCompactionIntervalSeconds)
+	engAi, eng2Err := engine2.NewStorageEngine(opts)
 	if eng2Err != nil {
 		logger.Error("Failed to create Engine2 instance", "error", eng2Err)
 		os.Exit(1)
