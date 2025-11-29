@@ -21,14 +21,8 @@ func TestReplaceWithSnapshot_E2E(t *testing.T) {
 
 	// leader data dir
 	leaderDir := filepath.Join(t.TempDir(), "leader")
-	ai, err := NewStorageEngine(StorageEngineOptions{DataDir: leaderDir})
-	if err != nil {
-		t.Fatalf("failed to create leader engine: %v", err)
-	}
+	ai := setupStorageEngineStart(t, StorageEngineOptions{DataDir: leaderDir})
 	leaderAdapter := ai.(*Engine2Adapter)
-	if err := leaderAdapter.Start(); err != nil {
-		t.Fatalf("failed to start leader adapter: %v", err)
-	}
 
 	// write some datapoints
 	fv, err := core.NewFieldValuesFromMap(map[string]interface{}{"v": 1.0})

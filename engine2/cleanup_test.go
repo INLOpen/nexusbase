@@ -16,10 +16,7 @@ func TestPeriodicCleanerStopsOnClose(t *testing.T) {
 		TmpFileCleanupThresholdSeconds: 0, // allow defaulting
 	}
 
-	ai, err := NewStorageEngine(opts)
-	if err != nil {
-		t.Fatalf("NewStorageEngine failed: %v", err)
-	}
+	ai := setupStorageEngineNoStart(t, opts)
 	a := ai.(*Engine2Adapter)
 
 	if a.cleanupCancel == nil {

@@ -24,10 +24,9 @@ func TestDeleteSeries(t *testing.T) {
 		BloomFilterFalsePositiveRate: 0.01,
 		Metrics:                      NewEngineMetrics(false, "delseries_tsdb_"),
 	}
-	eng, err := NewStorageEngine(opts)
-	require.NoError(t, err)
-	require.NoError(t, eng.Start())
+	eng := setupStorageEngineStart(t, opts)
 	defer eng.Close()
+	var err error
 
 	metric := "test.delete.series"
 	tags := map[string]string{"env": "dev"}
@@ -68,10 +67,9 @@ func TestDeletesByTimeRange(t *testing.T) {
 		BloomFilterFalsePositiveRate: 0.01,
 		Metrics:                      NewEngineMetrics(false, "delrange_tsdb_"),
 	}
-	eng, err := NewStorageEngine(opts)
-	require.NoError(t, err)
-	require.NoError(t, eng.Start())
+	eng := setupStorageEngineStart(t, opts)
 	defer eng.Close()
+	var err error
 
 	metric := "test.range.delete"
 	tags := map[string]string{"loc": "lab"}

@@ -18,9 +18,7 @@ func TestStorageEngine_VerifyDataConsistency_Extra(t *testing.T) {
 		opts.DataDir = engineDir
 		require.NoError(t, os.MkdirAll(engineDir, 0o755))
 
-		eng, err := NewStorageEngine(opts)
-		require.NoError(t, err)
-		require.NoError(t, eng.Start())
+		eng := setupStorageEngineStart(t, opts)
 
 		// Put some data and close to flush
 		require.NoError(t, eng.Put(context.Background(), HelperDataPoint(t, "consistent.metric.a", map[string]string{"tag": "a"}, 1, map[string]interface{}{"value": 1.0})))
@@ -28,9 +26,7 @@ func TestStorageEngine_VerifyDataConsistency_Extra(t *testing.T) {
 		require.NoError(t, eng.Close())
 
 		// Reopen and verify
-		eng2, err := NewStorageEngine(opts)
-		require.NoError(t, err)
-		require.NoError(t, eng2.Start())
+		eng2 := setupStorageEngineStart(t, opts)
 		defer eng2.Close()
 
 		errs := eng2.VerifyDataConsistency()
@@ -46,9 +42,7 @@ func TestStorageEngine_VerifyDataConsistency_Extra(t *testing.T) {
 		// Create a setup engine to produce an SSTable
 		setupOpts := opts
 		setupOpts.CompactionIntervalSeconds = 3600
-		setupEngine, err := NewStorageEngine(setupOpts)
-		require.NoError(t, err)
-		require.NoError(t, setupEngine.Start())
+		setupEngine := setupStorageEngineStart(t, setupOpts)
 		require.NoError(t, setupEngine.Put(context.Background(), HelperDataPoint(t, "minmax.test", map[string]string{"id": "a"}, 1, map[string]interface{}{"value": 1.0})))
 		require.NoError(t, setupEngine.Put(context.Background(), HelperDataPoint(t, "minmax.test", map[string]string{"id": "b"}, 2, map[string]interface{}{"value": 2.0})))
 		require.NoError(t, setupEngine.Close())
@@ -61,9 +55,7 @@ func TestStorageEngine_VerifyDataConsistency_Extra(t *testing.T) {
 		_ = sys.Remove(filepath.Join(engineDir, "string_mapping.log"))
 		_ = sys.Remove(filepath.Join(engineDir, "series_mapping.log"))
 
-		eng, err := NewStorageEngine(opts)
-		require.NoError(t, err)
-		require.NoError(t, eng.Start())
+		eng := setupStorageEngineStart(t, opts)
 		defer eng.Close()
 
 		errs := eng.VerifyDataConsistency()

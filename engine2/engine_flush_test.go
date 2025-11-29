@@ -17,11 +17,9 @@ import (
 // a new SSTable. The resulting SSTable file and manifest entry are verified.
 func TestAdapter_FlushMemtableToL0_Success(t *testing.T) {
 	dir := t.TempDir()
-	ai, err := NewStorageEngine(StorageEngineOptions{DataDir: dir})
-	require.NoError(t, err)
+	ai := setupStorageEngineStart(t, StorageEngineOptions{DataDir: dir})
 	// tests in this package rely on adapter-specific helpers; assert to concrete adapter
 	a := ai.(*Engine2Adapter)
-	require.NoError(t, a.Start())
 	defer a.Close()
 
 	// Put a datapoint using public adapter API
@@ -66,10 +64,8 @@ func TestAdapter_FlushMemtableToL0_Success(t *testing.T) {
 // by performing two write+swap cycles and flushing each swapped memtable.
 func TestAdapter_FlushRemainingMemtables(t *testing.T) {
 	dir := t.TempDir()
-	ai, err := NewStorageEngine(StorageEngineOptions{DataDir: dir})
-	require.NoError(t, err)
+	ai := setupStorageEngineStart(t, StorageEngineOptions{DataDir: dir})
 	a := ai.(*Engine2Adapter)
-	require.NoError(t, a.Start())
 	defer a.Close()
 
 	// First datapoint and flush

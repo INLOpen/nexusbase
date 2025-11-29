@@ -17,10 +17,8 @@ import (
 func TestAdapter_PeriodicAndSizeFlushEquivalents(t *testing.T) {
 	t.Run("PeriodicFlush_SuccessEquivalent", func(t *testing.T) {
 		dir := t.TempDir()
-		ai, err := NewStorageEngine(StorageEngineOptions{DataDir: dir})
-		require.NoError(t, err)
+		ai := setupStorageEngineStart(t, StorageEngineOptions{DataDir: dir})
 		a := ai.(*Engine2Adapter)
-		require.NoError(t, a.Start())
 		defer a.Close()
 
 		// Put a single datapoint
@@ -47,10 +45,8 @@ func TestAdapter_PeriodicAndSizeFlushEquivalents(t *testing.T) {
 
 	t.Run("PeriodicFlush_NoDataEquivalent", func(t *testing.T) {
 		dir := t.TempDir()
-		ai, err := NewStorageEngine(StorageEngineOptions{DataDir: dir})
-		require.NoError(t, err)
+		ai := setupStorageEngineStart(t, StorageEngineOptions{DataDir: dir})
 		a := ai.(*Engine2Adapter)
-		require.NoError(t, a.Start())
 		defer a.Close()
 
 		// Directly swap memtables when empty. Adapter swaps even empty memtables;
@@ -67,10 +63,8 @@ func TestAdapter_PeriodicAndSizeFlushEquivalents(t *testing.T) {
 
 	t.Run("SizeTriggerEquivalent", func(t *testing.T) {
 		dir := t.TempDir()
-		ai, err := NewStorageEngine(StorageEngineOptions{DataDir: dir})
-		require.NoError(t, err)
+		ai := setupStorageEngineStart(t, StorageEngineOptions{DataDir: dir})
 		a := ai.(*Engine2Adapter)
-		require.NoError(t, a.Start())
 		defer a.Close()
 
 		// Put multiple datapoints to simulate size pressure
@@ -99,10 +93,8 @@ func TestAdapter_PeriodicAndSizeFlushEquivalents(t *testing.T) {
 
 func TestAdapter_FlushRemainingMemtables_Equivalent(t *testing.T) {
 	dir := t.TempDir()
-	ai, err := NewStorageEngine(StorageEngineOptions{DataDir: dir})
-	require.NoError(t, err)
+	ai := setupStorageEngineStart(t, StorageEngineOptions{DataDir: dir})
 	a := ai.(*Engine2Adapter)
-	require.NoError(t, a.Start())
 	defer a.Close()
 
 	// Create one immutable-like memtable (flush directly) and one mutable (put+swap)
@@ -146,10 +138,8 @@ func TestAdapter_FlushRemainingMemtables_Equivalent(t *testing.T) {
 
 func TestAdapter_SyncMetadata_Equivalent(t *testing.T) {
 	dir := t.TempDir()
-	ai, err := NewStorageEngine(StorageEngineOptions{DataDir: dir})
-	require.NoError(t, err)
+	ai := setupStorageEngineStart(t, StorageEngineOptions{DataDir: dir})
 	a := ai.(*Engine2Adapter)
-	require.NoError(t, a.Start())
 	defer a.Close()
 
 	// Put and force a flush which should create manifest entries

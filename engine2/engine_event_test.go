@@ -143,8 +143,7 @@ func TestStorageEngine_PutEvent_EdgeCasesAndErrors(t *testing.T) {
 				tc.setupOpts(&opts)
 			}
 
-			engine, err := NewStorageEngine(opts)
-			require.NoError(t, err)
+			engine := setupStorageEngineStart(t, opts)
 
 			// Validate metric and tag names using a Validator (matches legacy engine behavior)
 			// Perform validation before starting the engine to avoid interference
@@ -152,8 +151,6 @@ func TestStorageEngine_PutEvent_EdgeCasesAndErrors(t *testing.T) {
 			validator := core.NewValidator()
 			vErr := core.ValidateMetricAndTags(validator, tc.metric, tc.tags)
 
-			err = engine.Start()
-			require.NoError(t, err)
 			defer engine.Close()
 			if tc.wantErr {
 				require.Error(t, vErr)
@@ -175,6 +172,7 @@ func TestStorageEngine_PutEvent_EdgeCasesAndErrors(t *testing.T) {
 				require.NoError(t, dpErr)
 			}
 
+			var err error
 			var event core.DataPoint
 			if dpErr == nil {
 				event = *dpPtr
