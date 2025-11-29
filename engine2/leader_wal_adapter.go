@@ -19,7 +19,13 @@ func openLeaderWAL(engine *Engine2, metrics *EngineMetrics) (wal.WALInterface, e
 	// Creating two WAL instances against the same directory can cause
 	// concurrent writers and corrupt segment contents.
 	if engine != nil && engine.wal != nil {
-		return &engine2WALWrapper{w: engine.wal, path: filepath.Join(engine.options.DataDir, "wal")}, nil
+		// When the engine already has an opened WAL, return the concrete
+		// WAL instance rather than wrapping it. Tests and other callers
+		// sometimes type-assert to *wal.WAL to install testing-only hooks
+		// (e.g. `TestingOnlyStreamerRegistered`). Returning the concrete
+		// pointer preserves that ability while still exposing the WAL via
+		// the wal.WALInterface.
+		return engine.wal, nil
 	}
 
 	// Otherwise, fall back to opening a standalone WAL in the data root.
