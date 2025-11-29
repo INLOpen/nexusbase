@@ -399,36 +399,28 @@ func (a *Engine2Adapter) Put(ctx context.Context, point core.DataPoint) error {
 		return vErr
 	}
 
-	var vb []byte
-	if point.Fields != nil {
-		enc, err := point.Fields.Encode()
-		if err != nil {
-			if a.metrics != nil {
-				a.metrics.PutErrorsTotal.Add(1)
-				a.metrics.RecomputeIngestionRatio()
-			}
-			return fmt.Errorf("failed to encode datapoint fields: %w", err)
-		}
-		vb = enc
-	}
+	// (Note: field encoding performed later for fallback string-key path.)
 	key := core.EncodeTSDBKeyWithString(point.Metric, point.Tags, point.Timestamp)
-	entry := core.WALEntry{EntryType: core.EntryTypePutEvent, Key: key, Value: vb}
-	if err := a.wal.Append(entry); err != nil {
-		if a.metrics != nil {
-			a.metrics.PutErrorsTotal.Add(1)
-			a.metrics.RecomputeIngestionRatio()
-		}
-		return fmt.Errorf("wal append failed: %w", err)
-	}
-	if a.metrics != nil {
-		a.metrics.WALEntriesWrittenTotal.Add(1)
-	}
 
 	// Prefer ID-encoded WALEntry when possible (more efficient).
 	if entry, encErr := a.encodeDataPointToWALEntry(&point); encErr == nil {
 		// Consume a single sequence number for this logical Put and reuse it
-		// for both the memtable write and the leader WAL append.
+		// for both the memtable write and the WAL append. We append once to
+		// the central WAL and avoid double-appending to leaderWal when it
+		// wraps the same underlying WAL instance.
 		seq := a.sequenceNumber.Add(1)
+
+		entry.SeqNum = seq
+		if err := a.wal.Append(*entry); err != nil {
+			if a.metrics != nil {
+				a.metrics.PutErrorsTotal.Add(1)
+				a.metrics.RecomputeIngestionRatio()
+			}
+			return fmt.Errorf("wal append failed: %w", err)
+		}
+		if a.metrics != nil {
+			a.metrics.WALEntriesWrittenTotal.Add(1)
+		}
 
 		if point.Metric == "system.load" {
 			slog.Default().Info("Engine2Adapter: writing to memtable", "metric", point.Metric, "ts", point.Timestamp, "entry_type", entry.EntryType, "value_len", len(entry.Value))
@@ -451,9 +443,17 @@ func (a *Engine2Adapter) Put(ctx context.Context, point core.DataPoint) error {
 			}
 		}
 
+		// If leaderWal is a distinct WAL instance (not a wrapper of engine.wal),
+		// append there too. Otherwise skip to avoid duplicate entries.
 		if a.leaderWal != nil {
-			entry.SeqNum = seq
-			_ = a.leaderWal.Append(*entry)
+			if lw, ok := a.leaderWal.(*engine2WALWrapper); ok {
+				if lw.w != a.wal {
+					_ = lw.Append(*entry)
+				}
+			} else {
+				// unknown concrete type; append as a best-effort
+				_ = a.leaderWal.Append(*entry)
+			}
 		}
 
 		// Publish a realtime update for subscribers (best-effort)
@@ -478,10 +478,23 @@ func (a *Engine2Adapter) Put(ctx context.Context, point core.DataPoint) error {
 	key = core.EncodeTSDBKeyWithString(point.Metric, point.Tags, point.Timestamp)
 	if len(point.Fields) == 0 {
 		seq := a.sequenceNumber.Add(1)
+		e := core.WALEntry{EntryType: core.EntryTypeDelete, Key: key, Value: nil, SeqNum: seq}
+		if err := a.wal.Append(e); err != nil {
+			return fmt.Errorf("wal append failed: %w", err)
+		}
+		if a.metrics != nil {
+			a.metrics.WALEntriesWrittenTotal.Add(1)
+		}
 		_ = a.mem.PutRaw(key, nil, core.EntryTypeDelete, seq)
+		// leaderWal duplicate avoidance: append only if distinct
 		if a.leaderWal != nil {
-			e := core.WALEntry{EntryType: core.EntryTypeDelete, Key: key, Value: nil, SeqNum: seq}
-			_ = a.leaderWal.Append(e)
+			if lw, ok := a.leaderWal.(*engine2WALWrapper); ok {
+				if lw.w != a.wal {
+					_ = lw.Append(e)
+				}
+			} else {
+				_ = a.leaderWal.Append(e)
+			}
 		}
 	} else {
 		vb, e := point.Fields.Encode()
@@ -493,10 +506,22 @@ func (a *Engine2Adapter) Put(ctx context.Context, point core.DataPoint) error {
 			return fmt.Errorf("failed to encode fields: %w", e)
 		}
 		seq := a.sequenceNumber.Add(1)
+		e2 := core.WALEntry{EntryType: core.EntryTypePutEvent, Key: key, Value: vb, SeqNum: seq}
+		if err := a.wal.Append(e2); err != nil {
+			return fmt.Errorf("wal append failed: %w", err)
+		}
+		if a.metrics != nil {
+			a.metrics.WALEntriesWrittenTotal.Add(1)
+		}
 		_ = a.mem.PutRaw(key, vb, core.EntryTypePutEvent, seq)
 		if a.leaderWal != nil {
-			e2 := core.WALEntry{EntryType: core.EntryTypePutEvent, Key: key, Value: vb, SeqNum: seq}
-			_ = a.leaderWal.Append(e2)
+			if lw, ok := a.leaderWal.(*engine2WALWrapper); ok {
+				if lw.w != a.wal {
+					_ = lw.Append(e2)
+				}
+			} else {
+				_ = a.leaderWal.Append(e2)
+			}
 		}
 
 		// Publish a realtime update for subscribers (best-effort)
@@ -633,6 +658,74 @@ func (a *Engine2Adapter) Get(ctx context.Context, metric string, tags map[string
 			return fv, nil
 		}
 	}
+
+	// Memtable did not contain the key. As a fallback (useful for
+	// tests that initialize state via fallback-scan over SSTables), scan
+	// on-disk SSTables under the data dir and attempt to read the key.
+	// This is intentionally a best-effort and relatively expensive path;
+	// higher-performance lookups should use tag index + levels manager.
+	if a.GetDataDir() != "" {
+		key := core.EncodeTSDBKeyWithString(metric, tags, timestamp)
+		// search legacy `sst` and new `sstables` dirs
+		dirs := []string{filepath.Join(a.GetDataDir(), "sst"), filepath.Join(a.GetDataDir(), "sstables")}
+		// Prepare alternate candidate keys (string-key already in `key`)
+		candidateKeys := make([][]byte, 0, 4)
+		candidateKeys = append(candidateKeys, key)
+		// If tag index & series store are available, resolve seriesIDs matching the tags
+		if a.tagIndexManager != nil && a.seriesIDStore != nil {
+			if bm, qerr := a.tagIndexManager.Query(tags); qerr == nil && bm != nil {
+				it := bm.Iterator()
+				for it.HasNext() {
+					sid := it.Next()
+					if seriesKeyStr, ok := a.seriesIDStore.GetKey(sid); ok {
+						// seriesKeyStr is the encoded series key bytes stored as string
+						kb := make([]byte, len(seriesKeyStr)+8)
+						copy(kb, []byte(seriesKeyStr))
+						// append big-endian timestamp
+						last := uint64(timestamp)
+						for i := 7; i >= 0; i-- {
+							kb[len(seriesKeyStr)+i] = byte(last & 0xFF)
+							last >>= 8
+						}
+						candidateKeys = append(candidateKeys, kb)
+					}
+				}
+			}
+		}
+		for _, d := range dirs {
+			files, err := os.ReadDir(d)
+			if err != nil {
+				continue
+			}
+			for _, f := range files {
+				if f.IsDir() || !strings.HasSuffix(f.Name(), ".sst") {
+					continue
+				}
+				path := filepath.Join(d, f.Name())
+				// best-effort: ignore load errors
+				tbl, lerr := sstable.LoadSSTable(sstable.LoadSSTableOptions{FilePath: path})
+				if lerr != nil {
+					continue
+				}
+				// try all candidate keys
+				for _, ck := range candidateKeys {
+					if !tbl.Contains(ck) {
+						continue
+					}
+					v, _, gerr := tbl.Get(ck)
+					if gerr == nil {
+						fv, derr := core.DecodeFieldsFromBytes(v)
+						if derr == nil {
+							_ = tbl.Close()
+							return fv, nil
+						}
+						// decoding failure: treat as not found for this key and continue
+					}
+				}
+				_ = tbl.Close()
+			}
+		}
+	}
 	return nil, sstable.ErrNotFound
 }
 func (a *Engine2Adapter) Delete(ctx context.Context, metric string, tags map[string]string, timestamp int64) error {
@@ -645,34 +738,33 @@ func (a *Engine2Adapter) Delete(ctx context.Context, metric string, tags map[str
 	if a.wal == nil || a.mem == nil {
 		return fmt.Errorf("engine2 not initialized")
 	}
-	// append tombstone entry to WAL (central wal expects core.WALEntry)
+	// Represent delete as memtable tombstone put and persist to WAL once.
 	dp := core.DataPoint{Metric: metric, Tags: tags, Timestamp: timestamp, Fields: nil}
 	key := core.EncodeTSDBKeyWithString(metric, tags, timestamp)
-	entry := core.WALEntry{EntryType: core.EntryTypeDelete, Key: key, Value: nil}
-	if err := a.wal.Append(entry); err != nil {
+	seq := a.sequenceNumber.Add(1)
+	// Append a scalar delete entry to central WAL with assigned SeqNum.
+	e := core.WALEntry{EntryType: core.EntryTypeDelete, Key: key, Value: nil, SeqNum: seq}
+	if err := a.wal.Append(e); err != nil {
 		return fmt.Errorf("wal append failed: %w", err)
 	}
 	if a.metrics != nil {
 		a.metrics.DeleteTotal.Add(1)
 		a.metrics.WALEntriesWrittenTotal.Add(1)
 	}
-	// Represent delete as memtable tombstone put
+	// Materialize memtable tombstone
 	if entry, err := a.encodeDataPointToWALEntry(&dp); err == nil {
-		seq := a.sequenceNumber.Add(1)
 		_ = a.mem.PutRaw(entry.Key, nil, core.EntryTypeDelete, seq)
 	} else {
-		key := core.EncodeTSDBKeyWithString(metric, tags, timestamp)
-		seq := a.sequenceNumber.Add(1)
 		_ = a.mem.PutRaw(key, nil, core.EntryTypeDelete, seq)
 	}
+	// leaderWal: append only if distinct from engine WAL
 	if a.leaderWal != nil {
-		// build delete WALEntry
-		if entry, encErr := a.encodeDataPointToWALEntry(&dp); encErr == nil {
-			// mark as delete event
-			entry.EntryType = core.EntryTypeDelete
-			seq := a.sequenceNumber.Add(1)
-			entry.SeqNum = seq
-			_ = a.leaderWal.Append(*entry)
+		if lw, ok := a.leaderWal.(*engine2WALWrapper); ok {
+			if lw.w != a.wal {
+				_ = lw.Append(e)
+			}
+		} else {
+			_ = a.leaderWal.Append(e)
 		}
 	}
 	return nil
@@ -690,7 +782,8 @@ func (a *Engine2Adapter) DeleteSeries(ctx context.Context, metric string, tags m
 	// represent series tombstone with timestamp -1
 	dp := core.DataPoint{Metric: metric, Tags: tags, Timestamp: -1, Fields: nil}
 	key := core.EncodeTSDBKeyWithString(metric, tags, -1)
-	entry := core.WALEntry{EntryType: core.EntryTypeDelete, Key: key, Value: nil}
+	seq := a.sequenceNumber.Add(1)
+	entry := core.WALEntry{EntryType: core.EntryTypeDelete, Key: key, Value: nil, SeqNum: seq}
 	if err := a.wal.Append(entry); err != nil {
 		return fmt.Errorf("wal append failed: %w", err)
 	}
@@ -700,7 +793,6 @@ func (a *Engine2Adapter) DeleteSeries(ctx context.Context, metric string, tags m
 	}
 	// Use a single tombstone key for timestamp -1 to mark series deletion
 	if entry, err := a.encodeDataPointToWALEntry(&dp); err == nil {
-		seq := a.sequenceNumber.Add(1)
 		_ = a.mem.PutRaw(entry.Key, nil, core.EntryTypeDelete, seq)
 		// For ID-encoded keys, seriesKey is the entry.Key without the
 		// trailing timestamp (last 8 bytes). Use that form when marking
@@ -708,7 +800,6 @@ func (a *Engine2Adapter) DeleteSeries(ctx context.Context, metric string, tags m
 		if len(entry.Key) >= 8 {
 			seriesKeyBytes := make([]byte, len(entry.Key)-8)
 			copy(seriesKeyBytes, entry.Key[:len(entry.Key)-8])
-			seq = a.sequenceNumber.Add(1)
 			a.deletedSeriesMu.Lock()
 			a.deletedSeries[string(seriesKeyBytes)] = seq
 			a.deletedSeriesMu.Unlock()
@@ -727,10 +818,8 @@ func (a *Engine2Adapter) DeleteSeries(ctx context.Context, metric string, tags m
 		}
 	} else {
 		key := core.EncodeTSDBKeyWithString(metric, tags, -1)
-		seq := a.sequenceNumber.Add(1)
 		_ = a.mem.PutRaw(key, nil, core.EntryTypeDelete, seq)
 		// string-encoded series key
-		seq = a.sequenceNumber.Add(1)
 		seriesKeyStr := string(core.EncodeSeriesKeyWithString(metric, tags))
 		// remove from activeSeries and tag index as well
 		a.activeSeriesMu.Lock()
@@ -748,11 +837,16 @@ func (a *Engine2Adapter) DeleteSeries(ctx context.Context, metric string, tags m
 		}
 	}
 	if a.leaderWal != nil {
-		if entry, encErr := a.encodeDataPointToWALEntry(&dp); encErr == nil {
-			entry.EntryType = core.EntryTypeDelete
-			seq := a.sequenceNumber.Add(1)
-			entry.SeqNum = seq
-			_ = a.leaderWal.Append(*entry)
+		if encEntry, encErr := a.encodeDataPointToWALEntry(&dp); encErr == nil {
+			encEntry.EntryType = core.EntryTypeDelete
+			encEntry.SeqNum = seq
+			if lw, ok := a.leaderWal.(*engine2WALWrapper); ok {
+				if lw.w != a.wal {
+					_ = lw.Append(*encEntry)
+				}
+			} else {
+				_ = a.leaderWal.Append(*encEntry)
+			}
 		}
 	}
 	return nil
@@ -2914,12 +3008,13 @@ func (a *Engine2Adapter) Start() error {
 
 		// Measure WAL replay duration and count recovered entries when metrics available.
 		walStart := time.Now()
-		// record sequence before replay so we can detect whether any WAL
-		// entries were applied.
 		// best-effort: ignore replay errors but log them via slog
-		_ = a.Engine2.ReplayWal(func(dp *core.DataPoint) error {
-			// increment sequence count
-			seq := a.sequenceNumber.Add(1)
+		_ = a.Engine2.ReplayWal(func(dp *core.DataPoint, seq uint64) error {
+			slog.Default().Info("WAL replay callback: recovered entry", "adapter_id", a.adapterID, "seq", seq, "metric", dp.Metric)
+			// Use the original WAL-provided sequence number instead of
+			// allocating a new one. This preserves recovered sequence
+			// semantics and avoids double-incrementing the adapter's
+			// sequence counter.
 			if a.metrics != nil {
 				a.metrics.WALRecoveredEntriesTotal.Add(1)
 			}
@@ -3093,6 +3188,9 @@ func (a *Engine2Adapter) Start() error {
 					}
 				}
 			}
+			// Ensure adapter's applied sequence number reflects the recovered entry
+			// (use Store rather than Add to avoid changing the original value).
+			a.sequenceNumber.Store(seq)
 			return nil
 		})
 		// record total duration (seconds) for WAL recovery
@@ -3338,24 +3436,60 @@ type engine2WALWrapper struct {
 	path string
 }
 
-func (e *engine2WALWrapper) AppendBatch(entries []core.WALEntry) error { return nil }
-func (e *engine2WALWrapper) Append(entry core.WALEntry) error          { return nil }
-func (e *engine2WALWrapper) Sync() error                               { return nil }
-func (e *engine2WALWrapper) Purge(upToIndex uint64) error              { return nil }
+func (e *engine2WALWrapper) AppendBatch(entries []core.WALEntry) error {
+	if e.w == nil {
+		return nil
+	}
+	return e.w.AppendBatch(entries)
+}
+func (e *engine2WALWrapper) Append(entry core.WALEntry) error {
+	if e.w == nil {
+		return nil
+	}
+	return e.w.Append(entry)
+}
+func (e *engine2WALWrapper) Sync() error {
+	if e.w == nil {
+		return nil
+	}
+	return e.w.Sync()
+}
+func (e *engine2WALWrapper) Purge(upToIndex uint64) error {
+	if e.w == nil {
+		return nil
+	}
+	return e.w.Purge(upToIndex)
+}
 func (e *engine2WALWrapper) Close() error {
 	if e.w == nil {
 		return nil
 	}
 	return e.w.Close()
 }
-func (e *engine2WALWrapper) Path() string {
-	return e.path
+func (e *engine2WALWrapper) Path() string { return e.path }
+func (e *engine2WALWrapper) SetTestingOnlyInjectCloseError(err error) {
+	if e.w == nil {
+		return
+	}
+	e.w.SetTestingOnlyInjectCloseError(err)
 }
-func (e *engine2WALWrapper) SetTestingOnlyInjectCloseError(err error) {}
-func (e *engine2WALWrapper) ActiveSegmentIndex() uint64               { return 0 }
-func (e *engine2WALWrapper) Rotate() error                            { return nil }
+func (e *engine2WALWrapper) ActiveSegmentIndex() uint64 {
+	if e.w == nil {
+		return 0
+	}
+	return e.w.ActiveSegmentIndex()
+}
+func (e *engine2WALWrapper) Rotate() error {
+	if e.w == nil {
+		return nil
+	}
+	return e.w.Rotate()
+}
 func (e *engine2WALWrapper) NewStreamReader(fromSeqNum uint64) (wal.StreamReader, error) {
-	return nil, fmt.Errorf("engine2 WAL wrapper does not support streaming")
+	if e.w == nil {
+		return nil, fmt.Errorf("engine2 WAL wrapper: no underlying WAL")
+	}
+	return e.w.NewStreamReader(fromSeqNum)
 }
 func (a *Engine2Adapter) GetStringStore() indexer.StringStoreInterface { return a.stringStore }
 

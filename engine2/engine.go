@@ -116,56 +116,12 @@ func NewEngine2(ctx context.Context, opts StorageEngineOptions) (*Engine2, error
 	}
 	m := memtable.NewMemtable2(memThreshold, clk)
 
-	// replay recovered WALEntry values into memtable
-	// Include all entry types (puts and deletes). Adapter-level replay will
-	// perform higher-level index/tag work, but pre-populating the memtable
-	// ensures in-memory state is available early. We avoid failing hard on
-	// individual decode errors and surface construction error only on fatal
-	// conditions.
-	for _, e := range recovered {
-		// Extract series identifier and components from the encoded key
-		seriesID, serr := core.ExtractSeriesIdentifierFromTSDBKeyWithString(e.Key)
-		if serr != nil {
-			return nil, fmt.Errorf("failed to extract series id from WAL key: %w", serr)
-		}
-		metricPart, _ := core.ExtractMetricFromSeriesKeyWithString(seriesID)
-		tagsMap, _ := core.ExtractTagsFromSeriesKeyWithString(seriesID)
-		// timestamp is last 8 bytes
-		if len(e.Key) < 8 {
-			return nil, fmt.Errorf("wal key too short to contain timestamp")
-		}
-		tsBytes := e.Key[len(e.Key)-8:]
-		ts := int64(0)
-		for i := 0; i < 8; i++ {
-			ts = (ts << 8) | int64(tsBytes[i])
-		}
-
-		// If entry is a delete (explicit or implied by empty value), write a
-		// tombstone into the memtable. Otherwise, populate with the decoded
-		// field values.
-		if e.EntryType == core.EntryTypeDelete || len(e.Value) == 0 {
-			// Use PutRaw to avoid re-encoding; memtable expects the full key as written on disk.
-			if err := m.PutRaw(e.Key, nil, core.EntryTypeDelete, 0); err != nil {
-				return nil, fmt.Errorf("failed to apply recovered WAL delete to memtable: %w", err)
-			}
-			continue
-		}
-
-		// Regular put event: write decoded fields into memtable. If decoding
-		// fails, return an error as this indicates a corrupted WAL payload.
-		var fv core.FieldValues
-		if len(e.Value) > 0 {
-			if decoded, derr := core.DecodeFieldsFromBytes(e.Value); derr == nil {
-				fv = decoded
-			} else {
-				return nil, fmt.Errorf("failed to decode WAL entry value: %w", derr)
-			}
-		}
-		dp := &core.DataPoint{Metric: string(metricPart), Tags: tagsMap, Timestamp: ts, Fields: fv}
-		if err := m.Put(dp); err != nil {
-			return nil, fmt.Errorf("failed to apply recovered WAL entry to memtable: %w", err)
-		}
-	}
+	// Note: recovered entries are preserved in `walRecovered` for callers to
+	// replay into higher-level adapter state (indexes, memtable, sequence
+	// numbers). We purposely avoid pre-populating the memtable here to ensure
+	// a single well-defined replay path exists (the adapter's ReplayWal).
+	// This prevents double-application of recovered entries and mismatches
+	// in sequence-number allocation.
 
 	return &Engine2{ctx: ctx, cancel: cancel, options: options, wal: w, walRecovered: recovered, walOpenErr: walOpenErr, mem: m}, nil
 }
@@ -173,7 +129,10 @@ func NewEngine2(ctx context.Context, opts StorageEngineOptions) (*Engine2, error
 // ReplayWal replays recovered WAL entries (from startup) into the provided
 // callback. This replaces the old engine2.WAL Replay method that no longer
 // exists now that the engine uses the central WAL package directly.
-func (e *Engine2) ReplayWal(fn func(*core.DataPoint) error) error {
+// The callback receives the decoded DataPoint and the original WAL
+// sequence number for that entry so callers can preserve on-disk sequence
+// semantics during recovery.
+func (e *Engine2) ReplayWal(fn func(*core.DataPoint, uint64) error) error {
 	for _, eEntry := range e.walRecovered {
 		// Decode key into components for all entry types and pass through
 		// as a DataPoint. The adapter's replay callback interprets deletes
@@ -201,7 +160,7 @@ func (e *Engine2) ReplayWal(fn func(*core.DataPoint) error) error {
 			}
 		}
 		dp := &core.DataPoint{Metric: string(metricPart), Tags: tagsMap, Timestamp: ts, Fields: fv}
-		if err := fn(dp); err != nil {
+		if err := fn(dp, eEntry.SeqNum); err != nil {
 			return err
 		}
 	}

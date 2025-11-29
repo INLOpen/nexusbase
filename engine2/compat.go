@@ -3,14 +3,11 @@ package engine2
 import (
 	"context"
 	"log/slog"
-	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/INLOpen/nexusbase/compressors"
 	"github.com/INLOpen/nexusbase/core"
 	"github.com/INLOpen/nexusbase/sstable"
-	"github.com/INLOpen/nexusbase/sys"
 )
 
 // Compatibility aliases to ease migrating callers from `engine` -> `engine2`.
@@ -90,18 +87,16 @@ func GetBaseOptsForTest(t *testing.T, prefix string) StorageEngineOptions {
 	// developer can re-run a single failing test and inspect WAL/sstable
 	// files afterward. This only activates when the env var is present.
 	dataDir := t.TempDir()
-	if base := os.Getenv("NEXUSBASE_PERSIST_TESTDIR"); base != "" {
-		// Create a path like <base>/<prefix><TestName>
-		persistent := filepath.Join(base, prefix+t.Name())
-		_ = os.MkdirAll(persistent, 0755)
-		dataDir = persistent
-	}
+	/*
+		if base := os.Getenv("NEXUSBASE_PERSIST_TESTDIR"); base != "" {
+			// Create a path like <base>/<prefix><TestName>
+			persistent := filepath.Join(base, prefix+t.Name())
+			_ = os.MkdirAll(persistent, 0755)
+			dataDir = persistent
+		}
+	*/
 
-	// Allow enabling sys debug mode to trace low-level file operations during
-	// tests. Set environment variable `NEXUSBASE_DEBUG_SYS=1` to activate.
-	if os.Getenv("NEXUSBASE_DEBUG_SYS") == "1" {
-		sys.SetDebugMode(true)
-	}
+	// Note: sys debug mode is no longer enabled via environment variable.
 
 	// Provide minimal, sensible defaults used by engine2 tests. The full
 	// StorageEngineOptions type exists in `options.go` so tests can still set

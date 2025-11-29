@@ -15,13 +15,12 @@ import (
 	"github.com/INLOpen/nexusbase/compressors"
 	"github.com/INLOpen/nexusbase/core"
 	"github.com/INLOpen/nexusbase/sstable"
-	"github.com/INLOpen/nexusbase/sys"
 	"github.com/INLOpen/nexusbase/wal"
 	"github.com/stretchr/testify/require"
 )
 
 func init() {
-	sys.SetDebugMode(false)
+	// sys.SetDebugMode(false)
 }
 
 // testDataPoint is a helper struct for defining test data points in this file.

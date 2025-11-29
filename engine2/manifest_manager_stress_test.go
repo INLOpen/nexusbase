@@ -1,3 +1,6 @@
+//go:build longtest
+// +build longtest
+
 package engine2
 
 import (

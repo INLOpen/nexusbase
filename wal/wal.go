@@ -86,6 +86,8 @@ type WAL struct {
 
 	// Buffer pool for encoding WALEntry payloads to reduce allocations.
 	bufPool *sync.Pool
+	// sequenceCounter holds the last assigned sequence number for WAL entries.
+	sequenceCounter atomic.Uint64
 }
 
 var _ WALInterface = (*WAL)(nil)
@@ -230,6 +232,17 @@ func Open(opts Options) (*WAL, []core.WALEntry, error) {
 	}
 
 	recoveredEntries, recoveryErr := w.recover(opts.StartRecoveryIndex)
+
+	// Initialize sequence counter from recovered entries so newly-written
+	// entries receive strictly-increasing sequence numbers that continue
+	// from on-disk values.
+	var maxSeq uint64
+	for _, re := range recoveredEntries {
+		if re.SeqNum > maxSeq {
+			maxSeq = re.SeqNum
+		}
+	}
+	w.sequenceCounter.Store(maxSeq)
 
 	if err := w.openForAppend(); err != nil {
 		return nil, nil, fmt.Errorf("failed to open WAL for appending: %w", err)
