@@ -88,6 +88,10 @@ type WAL struct {
 	bufPool *sync.Pool
 	// sequenceCounter holds the last assigned sequence number for WAL entries.
 	sequenceCounter atomic.Uint64
+	// Testing-only: optional counter incremented whenever the WAL performs a
+	// file sync (SegmentWriter.Sync). Tests may set this to observe sync calls
+	// without needing to mock the underlying file implementation.
+	TestingOnlySyncCount *atomic.Uint64
 }
 
 var _ WALInterface = (*WAL)(nil)

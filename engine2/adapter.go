@@ -121,6 +121,15 @@ type Engine2Adapter struct {
 	// for it to exit before returning.
 	cleanupWg sync.WaitGroup
 
+	// walSyncCancel cancels the periodic WAL.Sync() goroutine started when
+	// `WALSyncMode == core.WALSyncInterval`. Tests set/inspect the WAL's
+	// TestingOnlySyncCount to validate periodic syncs; the adapter manages
+	// lifecycle of the goroutine using this cancel func and wg.
+	walSyncCancel context.CancelFunc
+	// walSyncWg tracks the periodic WAL.Sync goroutine so Close() can wait
+	// for it to exit before returning.
+	walSyncWg sync.WaitGroup
+
 	// indicates startup used fallback scan (manifest missing/empty)
 	fallbackScanned atomic.Bool
 
@@ -140,6 +149,17 @@ type Engine2Adapter struct {
 	// flush error. Tests can close this channel to allow the adapter to
 	// proceed, enabling deterministic coordination.
 	TestingOnlyFlushBlock chan struct{}
+
+	// Testing-only notification channel for WAL.Sync ticks. When non-nil
+	// the WAL sync goroutine will send a notification on this channel after
+	// each attempted Sync(). Tests may provide a buffered channel or set
+	// `TestingOnlyWALSyncNotifyBlocking` to control blocking behavior.
+	TestingOnlyWALSyncNotify chan struct{}
+	// When true and `TestingOnlyWALSyncNotify` is non-nil, the adapter will
+	// perform a blocking send on the channel for each tick. When false, the
+	// send is non-blocking (best-effort) to avoid impacting production.
+	// Default: true (tests that opt-in will block until the test reads).
+	TestingOnlyWALSyncNotifyBlocking bool
 }
 
 // NewEngine2Adapter wraps an existing Engine2.
@@ -161,6 +181,8 @@ func NewEngine2AdapterWithHooks(e *Engine2, hm hooks.HookManager) *Engine2Adapte
 		// default chunk payload size: 16KB
 		maxChunkBytes:           16 * 1024,
 		sstableDefaultBlockSize: sstable.DefaultBlockSize,
+		// default test-notify behavior: blocking sends to ensure deterministic tests
+		TestingOnlyWALSyncNotifyBlocking: true,
 	}
 	// defaults for memtable snapshot conversion
 	a.memtableThreshold = 1 << 30
@@ -3357,6 +3379,48 @@ func (a *Engine2Adapter) Start() error {
 
 	// mark started for snapshot provider
 	a.started.Store(true)
+
+	// Start periodic WAL.Sync() when configured to use interval-based
+	// syncing. We use a cancellable context derived from the engine's
+	// context so Close() can stop the goroutine promptly. Only start the
+	// goroutine when the Engine's WAL exists and an interval > 0 is set.
+	if a.Engine2 != nil && a.Engine2.wal != nil && a.options.WALSyncMode == core.WALSyncInterval && a.options.WALFlushIntervalMs > 0 {
+		ctx, cancel := context.WithCancel(a.Engine2.GetContext())
+		a.walSyncCancel = cancel
+		a.walSyncWg.Add(1)
+		iv := time.Duration(a.options.WALFlushIntervalMs) * time.Millisecond
+		go func(ctx context.Context, iv time.Duration) {
+			defer a.walSyncWg.Done()
+			ticker := time.NewTicker(iv)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					// best-effort: ignore sync errors but attempt to call Sync()
+					if a != nil && a.Engine2 != nil && a.Engine2.wal != nil {
+						_ = a.Engine2.wal.Sync()
+						// Notify test hook if present. Tests that need
+						// deterministic synchronization should set
+						// `TestingOnlyWALSyncNotify` (and optionally enable
+						// blocking behavior) before calling `Start()`.
+						if a.TestingOnlyWALSyncNotify != nil {
+							if a.TestingOnlyWALSyncNotifyBlocking {
+								// blocking send (tests must read to avoid deadlock)
+								a.TestingOnlyWALSyncNotify <- struct{}{}
+							} else {
+								select {
+								case a.TestingOnlyWALSyncNotify <- struct{}{}:
+								default:
+								}
+							}
+						}
+					}
+				}
+			}
+		}(ctx, iv)
+	}
 	return nil
 }
 func (a *Engine2Adapter) Close() error {
@@ -3370,6 +3434,16 @@ func (a *Engine2Adapter) Close() error {
 	// Cancel engine-level context so any derived contexts stop promptly.
 	if a.Engine2 != nil {
 		_ = a.Engine2.Close()
+	}
+
+	// signal periodic WAL.Sync() goroutine to stop if it was started
+	// Do this before closing the WAL to ensure the goroutine stops and
+	// does not race with WAL.Close(), which could result in additional
+	// sync activity after Close() returns.
+	if a.walSyncCancel != nil {
+		a.walSyncCancel()
+		a.walSyncWg.Wait()
+		a.walSyncCancel = nil
 	}
 
 	if a.wal != nil {
@@ -3414,6 +3488,14 @@ func (a *Engine2Adapter) Close() error {
 		a.cleanupCancel()
 		a.cleanupWg.Wait()
 		a.cleanupCancel = nil
+	}
+
+	// signal periodic WAL.Sync() goroutine to stop if it was started
+	if a.walSyncCancel != nil {
+		// request cancellation and wait for the goroutine to exit
+		a.walSyncCancel()
+		a.walSyncWg.Wait()
+		a.walSyncCancel = nil
 	}
 
 	// reset sequence number
