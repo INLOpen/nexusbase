@@ -271,6 +271,21 @@ func (w *WAL) commit(records []*commitRecord) {
 		w.mu.Unlock()
 	}
 
+	// If configured for batch sync, perform a single Sync() for the commit
+	// after all payloads have been written. This provides durability at the
+	// commit granularity without doing an fsync per payload.
+	if finalErr == nil && w.opts.SyncMode == core.WALSyncBatch {
+		w.mu.Lock()
+		if w.activeSegment != nil {
+			if err := w.activeSegment.Sync(); err != nil {
+				finalErr = err
+			} else if w.TestingOnlySyncCount != nil {
+				w.TestingOnlySyncCount.Add(1)
+			}
+		}
+		w.mu.Unlock()
+	}
+
 	// Notify all original waiters of the final result (same error for everyone)
 	for _, rec := range records {
 		rec.done <- finalErr

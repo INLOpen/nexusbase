@@ -29,7 +29,7 @@ engine:
     check_interval: "120s"
     fallback_strategy: "PickOldest"
   wal:
-    sync_mode: "interval"
+    sync_mode: "interval" # valid: always, batch, interval, disabled — 'batch' fsyncs once per logical commit (good durability/perf tradeoff)
     batch_size: 1
     flush_interval: "1000ms"
     max_segment_size_bytes: 33554432

@@ -78,3 +78,51 @@ func TestWALSyncModes(t *testing.T) {
 		})
 	}
 }
+
+// Test that when SyncMode == WALSyncBatch the WAL performs exactly one
+// file sync per logical commit even if the commit writes multiple payloads.
+func TestWALSyncBatchMode(t *testing.T) {
+	dir := t.TempDir()
+	opts := Options{
+		Dir:      dir,
+		SyncMode: core.WALSyncBatch,
+		// Make CommitMaxDelay long so the committer groups quick appends
+		// into a single commit based on CommitMaxBatchSize rather than a
+		// timer tick.
+		CommitMaxDelay:     10 * time.Millisecond,
+		CommitMaxBatchSize: 3,   // group 3 append requests into a single commit
+		MaxSegmentSize:     128, // small segment so multiple payloads can be produced
+	}
+
+	w, _, err := Open(opts)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	var ctr atomic.Uint64
+	w.TestingOnlySyncCount = &ctr
+
+	commits := 5
+	// For each logical commit, write a single AppendBatch containing many
+	// entries. The committer will encode these into multiple payloads (due
+	// to small MaxSegmentSize), but batch mode should perform one Sync()
+	// per AppendBatch call (per commit).
+	for c := 0; c < commits; c++ {
+		batchEntries := make([]core.WALEntry, 0, 10)
+		for i := 0; i < 10; i++ {
+			batchEntries = append(batchEntries, core.WALEntry{EntryType: core.EntryTypePutEvent, Key: []byte("k"), Value: make([]byte, 80)})
+		}
+		if err := w.AppendBatch(batchEntries); err != nil {
+			t.Fatalf("AppendBatch failed: %v", err)
+		}
+	}
+
+	// Expect exactly `commits` syncs (one per logical AppendBatch).
+	got := ctr.Load()
+	if got != uint64(commits) {
+		t.Fatalf("expected %d Sync() calls for batch commits, got %d", commits, got)
+	}
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+}

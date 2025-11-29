@@ -27,7 +27,7 @@ engine:
     check_interval: 30s
     fallback_strategy: PickOldest
   wal:
-    sync_mode: interval
+    sync_mode: interval # valid: always, batch, interval, disabled — 'batch' fsyncs once per logical commit (good durability/perf tradeoff)
     flush_interval: 1000ms
   index:
     memtable_threshold: 10000
