@@ -3017,7 +3017,6 @@ func (a *Engine2Adapter) Start() error {
 			var dp core.DataPoint
 			// Ensure there is a timestamp suffix
 			if len(e.Key) < 8 {
-				slog.Default().Warn("WAL replay: key too short, skipping", "adapter_id", a.adapterID, "key_len", len(e.Key))
 				return nil
 			}
 			seriesKey := e.Key[:len(e.Key)-8]
@@ -3058,7 +3057,6 @@ func (a *Engine2Adapter) Start() error {
 				// Fallback: treat as legacy string-encoded key
 				seriesID, serr := core.ExtractSeriesIdentifierFromTSDBKeyWithString(e.Key)
 				if serr != nil {
-					slog.Default().Warn("WAL replay: failed to extract series id from key", "adapter_id", a.adapterID, "err", serr)
 					return nil
 				}
 				metricPart, _ := core.ExtractMetricFromSeriesKeyWithString(seriesID)
@@ -3077,7 +3075,7 @@ func (a *Engine2Adapter) Start() error {
 					}
 				}
 			}
-			slog.Default().Info("WAL replay callback: recovered entry", "adapter_id", a.adapterID, "seq", seq, "metric", dp.Metric)
+			slog.Default().Debug("WAL replay callback: recovered entry", "adapter_id", a.adapterID, "seq", seq, "metric", dp.Metric)
 			if a.metrics != nil {
 				a.metrics.WALRecoveredEntriesTotal.Add(1)
 			}
@@ -3187,13 +3185,9 @@ func (a *Engine2Adapter) Start() error {
 					// ensure memtable has a tombstone for this representative key
 					if a.mem != nil {
 						if we, err := a.encodeDataPointToWALEntry(&dp); err == nil {
-							khex := hex.EncodeToString(we.Key)
-							slog.Default().Info("WAL replay: memtable PutRaw (range-delete)", "adapter_id", a.adapterID, "key_hex", khex, "seq", seq)
 							_ = a.mem.PutRaw(we.Key, nil, core.EntryTypeDelete, seq)
 						} else {
 							key := core.EncodeTSDBKeyWithString(dp.Metric, dp.Tags, dp.Timestamp)
-							khex := hex.EncodeToString(key)
-							slog.Default().Info("WAL replay: memtable PutRaw (range-delete)", "adapter_id", a.adapterID, "key_hex", khex, "seq", seq)
 							_ = a.mem.PutRaw(key, nil, core.EntryTypeDelete, seq)
 						}
 					}
@@ -3231,35 +3225,25 @@ func (a *Engine2Adapter) Start() error {
 					// write delete tombstone using the same key encoding the
 					// adapter would normally use when encoding datapoints.
 					if we, err := a.encodeDataPointToWALEntry(&dp); err == nil {
-						khex := hex.EncodeToString(we.Key)
-						slog.Default().Info("WAL replay: memtable PutRaw (point-delete)", "adapter_id", a.adapterID, "key_hex", khex, "seq", seq)
 						_ = a.mem.PutRaw(we.Key, nil, core.EntryTypeDelete, seq)
 					} else {
 						key := core.EncodeTSDBKeyWithString(dp.Metric, dp.Tags, dp.Timestamp)
-						khex := hex.EncodeToString(key)
-						slog.Default().Info("WAL replay: memtable PutRaw (point-delete)", "adapter_id", a.adapterID, "key_hex", khex, "seq", seq)
 						_ = a.mem.PutRaw(key, nil, core.EntryTypeDelete, seq)
 					}
 				} else {
 					if we, err := a.encodeDataPointToWALEntry(&dp); err == nil {
-						khex := hex.EncodeToString(we.Key)
 						if we.EntryType == core.EntryTypeDelete || len(we.Value) == 0 {
-							slog.Default().Info("WAL replay: memtable PutRaw (delete-or-empty)", "adapter_id", a.adapterID, "key_hex", khex, "seq", seq)
 							_ = a.mem.PutRaw(we.Key, nil, core.EntryTypeDelete, seq)
 						} else {
-							slog.Default().Info("WAL replay: memtable PutRaw (put)", "adapter_id", a.adapterID, "key_hex", khex, "seq", seq, "val_len", len(we.Value))
 							_ = a.mem.PutRaw(we.Key, we.Value, core.EntryTypePutEvent, seq)
 						}
 					} else {
 						// fallback to string-key encoding
 						key := core.EncodeTSDBKeyWithString(dp.Metric, dp.Tags, dp.Timestamp)
-						khex := hex.EncodeToString(key)
 						if dp.Timestamp == -1 || len(dp.Fields) == 0 {
-							slog.Default().Info("WAL replay: memtable PutRaw (fallback-delete)", "adapter_id", a.adapterID, "key_hex", khex, "seq", seq)
 							_ = a.mem.PutRaw(key, nil, core.EntryTypeDelete, seq)
 						} else {
 							vb, _ := dp.Fields.Encode()
-							slog.Default().Info("WAL replay: memtable PutRaw (fallback-put)", "adapter_id", a.adapterID, "key_hex", khex, "seq", seq, "val_len", len(vb))
 							_ = a.mem.PutRaw(key, vb, core.EntryTypePutEvent, seq)
 						}
 					}

@@ -70,13 +70,9 @@ func (w *WAL) commit(records []*commitRecord) {
 					break
 				}
 			}
-			// Diagnostic: caller provided SeqNum; record for traceability
-			slog.Default().Info("WAL: committer honoring caller-provided SeqNum", "caller_seq", allEntries[i].SeqNum)
 		} else {
 			newSeq := w.sequenceCounter.Add(1)
 			allEntries[i].SeqNum = newSeq
-			// Diagnostic: committer assigned a SeqNum
-			slog.Default().Info("WAL: committer assigned SeqNum", "assigned_seq", newSeq)
 		}
 	}
 
