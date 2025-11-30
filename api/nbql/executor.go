@@ -284,13 +284,33 @@ func processQueryIterator(iter core.QueryResultIteratorInterface) ([]QueryResult
 
 		// Convert core.QueryResultItem to nbql.QueryResultLine
 		resultLine := QueryResultLine{
-			Metric:           item.Metric,
-			Tags:             item.Tags,
-			Timestamp:        item.Timestamp,
-			IsAggregated:     item.IsAggregated,
-			WindowStartTime:  item.WindowStartTime,
-			AggregatedValues: item.AggregatedValues,
-			Fields:           item.Fields,
+			Metric:          item.Metric,
+			Timestamp:       item.Timestamp,
+			IsAggregated:    item.IsAggregated,
+			WindowStartTime: item.WindowStartTime,
+		}
+
+		// Copy maps so the returned results do not reference pooled memory
+		if item.Tags != nil {
+			tagsCopy := make(map[string]string, len(item.Tags))
+			for k, v := range item.Tags {
+				tagsCopy[k] = v
+			}
+			resultLine.Tags = tagsCopy
+		}
+		if item.AggregatedValues != nil {
+			aggCopy := make(map[string]float64, len(item.AggregatedValues))
+			for k, v := range item.AggregatedValues {
+				aggCopy[k] = v
+			}
+			resultLine.AggregatedValues = aggCopy
+		}
+		if item.Fields != nil {
+			fv := make(core.FieldValues, len(item.Fields))
+			for k, v := range item.Fields {
+				fv[k] = v
+			}
+			resultLine.Fields = fv
 		}
 
 		results = append(results, resultLine)
