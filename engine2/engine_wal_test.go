@@ -76,13 +76,7 @@ func TestStorageEngine_WALRecovery_CrashSimulation(t *testing.T) {
 		require.NoError(t, w.Close())
 	}
 
-	engine2, err := NewStorageEngine(opts)
-	if err != nil {
-		t.Fatalf("NewStorageEngine (engine2) for recovery failed: %v", err)
-	}
-	if err = engine2.Start(); err != nil {
-		t.Fatalf("Failed to start setup engine: %v", err)
-	}
+	engine2 := setupStorageEngineStart(t, opts)
 	defer engine2.Close()
 
 	for i := 1; i <= 3; i++ {
@@ -189,13 +183,7 @@ func TestStorageEngine_WALRecovery_WithDeletes(t *testing.T) {
 		require.NoError(t, w.Close())
 	}
 
-	engine2, err := NewStorageEngine(opts)
-	if err != nil {
-		t.Fatalf("NewStorageEngine (engine2) for recovery failed: %v", err)
-	}
-	if err = engine2.Start(); err != nil {
-		t.Fatalf("Failed to start setup engine: %v", err)
-	}
+	engine2 := setupStorageEngineStart(t, opts)
 	defer engine2.Close()
 
 	if _, err := engine2.Get(context.Background(), "metric.keep", map[string]string{"id": "keep"}, 1000); err != nil {
@@ -285,16 +273,14 @@ func TestStorageEngine_WALRecovery_AdvancedCorruption(t *testing.T) {
 			t.Fatalf("Failed to corrupt WAL segment magic: %v", err)
 		}
 
-		eng2, err := NewStorageEngine(opts)
-		if err != nil {
-			t.Fatal("NewStorageEngine should not have failed on corrupted WAL header, but it did")
-		}
+		eng2 := setupStorageEngineNoStart(t, opts)
 
-		if err = eng2.Start(); err == nil {
+		if err := eng2.Start(); err == nil {
 			t.Fatal("NewStorageEngine should have failed on corrupted WAL header, but it succeeded")
-		}
-		if !strings.Contains(err.Error(), "invalid magic number") {
-			t.Errorf("Expected error message to contain 'invalid magic number', but got: %v", err)
+		} else {
+			if !strings.Contains(err.Error(), "invalid magic number") {
+				t.Errorf("Expected error message to contain 'invalid magic number', but got: %v", err)
+			}
 		}
 	})
 
@@ -308,17 +294,14 @@ func TestStorageEngine_WALRecovery_AdvancedCorruption(t *testing.T) {
 			t.Fatalf("Failed to truncate WAL segment file: %v", err)
 		}
 
-		eng, err := NewStorageEngine(opts)
-		if err != nil {
-			t.Fatal("NewStorageEngine should not have failed on corrupted WAL header, but it did")
-		}
+		eng := setupStorageEngineNoStart(t, opts)
 
-		if err = eng.Start(); err == nil {
+		if err := eng.Start(); err == nil {
 			t.Fatal("NewStorageEngine should have failed on corrupted WAL header, but it succeeded")
-		}
-
-		if !errors.Is(err, io.ErrUnexpectedEOF) && !strings.Contains(err.Error(), "unexpected EOF") && !strings.Contains(err.Error(), "failed to read") {
-			t.Errorf("Expected an unexpected EOF or read error, but got: %v", err)
+		} else {
+			if !errors.Is(err, io.ErrUnexpectedEOF) && !strings.Contains(err.Error(), "unexpected EOF") && !strings.Contains(err.Error(), "failed to read") {
+				t.Errorf("Expected an unexpected EOF or read error, but got: %v", err)
+			}
 		}
 
 	})
@@ -333,16 +316,14 @@ func TestStorageEngine_WALRecovery_AdvancedCorruption(t *testing.T) {
 			t.Fatalf("Failed to set invalid record length: %v", err)
 		}
 
-		eng, err := NewStorageEngine(opts)
-		if err != nil {
-			t.Fatal("NewStorageEngine should not have failed on corrupted WAL header, but it did")
-		}
+		eng := setupStorageEngineNoStart(t, opts)
 
-		if err = eng.Start(); err == nil {
+		if err := eng.Start(); err == nil {
 			t.Fatal("NewStorageEngine should have failed on corrupted WAL header, but it succeeded")
-		}
-		if !strings.Contains(err.Error(), "exceeds sanity limit") {
-			t.Errorf("Expected error to contain 'exceeds sanity limit', but got: %v", err)
+		} else {
+			if !strings.Contains(err.Error(), "exceeds sanity limit") {
+				t.Errorf("Expected error to contain 'exceeds sanity limit', but got: %v", err)
+			}
 		}
 	})
 }
@@ -362,13 +343,7 @@ func TestStorageEngine_Recovery_CorruptedWALWithValidManifest(t *testing.T) {
 		SSTableCompressor:            &compressors.NoCompressionCompressor{},
 	}
 
-	engine1, err := NewStorageEngine(opts)
-	if err != nil {
-		t.Fatalf("Phase 1: NewStorageEngine failed: %v", err)
-	}
-	if err = engine1.Start(); err != nil {
-		t.Fatalf("Phase 1: Failed to start setup engine: %v", err)
-	}
+	engine1 := setupStorageEngineStart(t, opts)
 
 	pointInManifest := testDataPoint{"metric.stable", map[string]string{"state": "manifest"}, 1000, 100.0}
 	if err := engine1.Put(context.Background(), HelperDataPoint(t, pointInManifest.metric, pointInManifest.tags, pointInManifest.timestamp, map[string]interface{}{"value": pointInManifest.value})); err != nil {
@@ -447,15 +422,13 @@ func TestStorageEngine_Recovery_CorruptedWALWithValidManifest(t *testing.T) {
 		t.Fatalf("Phase 3: Failed to corrupt WAL segment magic: %v", err)
 	}
 
-	eng3, err := NewStorageEngine(opts)
-	if err != nil {
-		t.Fatalf("Phase 4:  NewStorageEngine failed: %v", err)
-	}
-	if err = eng3.Start(); err == nil {
+	eng3 := setupStorageEngineNoStart(t, opts)
+	if err := eng3.Start(); err == nil {
 		t.Fatal("Phase 4: Start should have failed due to corrupted WAL, but it succeeded")
-	}
-	if !(strings.Contains(err.Error(), "invalid magic number") || strings.Contains(err.Error(), "unexpected EOF")) {
-		t.Errorf("Expected error to contain 'invalid magic number' or 'unexpected EOF', but got: %v", err)
+	} else {
+		if !(strings.Contains(err.Error(), "invalid magic number") || strings.Contains(err.Error(), "unexpected EOF")) {
+			t.Errorf("Expected error to contain 'invalid magic number' or 'unexpected EOF', but got: %v", err)
+		}
 	}
 }
 
@@ -513,13 +486,7 @@ func TestStorageEngine_WALRecovery_TagIndex(t *testing.T) {
 	}
 
 	opts.Metrics = NewEngineMetrics(false, "wal_tag_index_recovery_")
-	engine2, err := NewStorageEngine(opts)
-	if err != nil {
-		t.Fatalf("NewStorageEngine (engine2) for recovery failed: %v", err)
-	}
-	if err = engine2.Start(); err != nil {
-		t.Fatalf("Failed to start setup engine: %v", err)
-	}
+	engine2 := setupStorageEngineStart(t, opts)
 	defer engine2.Close()
 	metric1 := "cpu.usage"
 	tags1 := map[string]string{"host": "serverA", "region": "us-east"}
@@ -621,17 +588,12 @@ func TestStorageEngine_WALRecovery_RangeTombstones(t *testing.T) {
 	}
 
 	opts.Metrics = NewEngineMetrics(false, "wal_range_tombstone_recovery_")
-	engine2, err := NewStorageEngine(opts)
-	if err != nil {
-		t.Fatalf("NewStorageEngine (engine2) for recovery failed: %v", err)
-	}
-	if err = engine2.Start(); err != nil {
-		t.Fatalf("Failed to start setup engine: %v", err)
-	}
+	engine2 := setupStorageEngineStart(t, opts)
 	defer engine2.Close()
 	metric := "sensor.temp"
 	tags := map[string]string{"location": "room1"}
 
+	var err error
 	_, err = engine2.Get(context.Background(), metric, tags, 2000)
 	if err != sstable.ErrNotFound {
 		t.Errorf("Expected range-deleted point at %d to be ErrNotFound after WAL recovery, got %v", 2000, err)

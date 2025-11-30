@@ -1,8 +1,6 @@
 package engine2
 
 import (
-	"context"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,18 +19,7 @@ func TestEngine2Adapter_WALSyncInterval(t *testing.T) {
 		WALBatchSize:       1,
 	}
 
-	e, err := NewEngine2(context.Background(), opts)
-	if err != nil {
-		t.Fatalf("NewEngine2 failed: %v", err)
-	}
-	if e == nil || e.wal == nil {
-		t.Fatalf("expected engine with WAL to be created")
-	}
-
-	// Install testing-only counter so we can observe Sync() calls.
-	e.wal.TestingOnlySyncCount = &atomic.Uint64{}
-
-	a := NewEngine2Adapter(e)
+	e, a := setupEngineAndAdapterNoStart(t, opts)
 
 	// Expose a test-only notify channel to observe ticks deterministically.
 	intervals := 8
@@ -64,7 +51,5 @@ func TestEngine2Adapter_WALSyncInterval(t *testing.T) {
 		t.Fatalf("expected %d periodic WAL.Sync() calls, got %d", expected, final)
 	}
 
-	if err := a.Close(); err != nil {
-		t.Fatalf("adapter Close failed: %v", err)
-	}
+	closeAdapter(t, a)
 }

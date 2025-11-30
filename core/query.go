@@ -66,6 +66,19 @@ type QueryIterator interface {
 	UnderlyingAt() (*IteratorNode, error)
 }
 
+// Ownership contract note:
+// - Implementations of `IteratorPoolInterface[*QueryResultItem]` may return
+//   a pooled `*QueryResultItem` from `At()`. That pooled item is backed by
+//   per-iterator buffers and reusable maps (e.g., `Tags`, `Fields`,
+//   `AggregatedValues`). Callers MUST NOT retain references to those maps or
+//   the `*QueryResultItem` after calling `Put(item)` or advancing the
+//   iterator. `Put(item)` will clear maps and return internal buffers to the
+//   pool.
+// - If a caller needs to keep a stable copy of the current item beyond the
+//   iterator's lifecycle, they must either call `AtValue()` (which returns a
+//   value-copy) or deep-copy the maps/FieldValues before returning the item
+//   to the pool.
+
 // QueryResultIteratorInterface is the original name kept for compatibility
 // and now aliases the richer `QueryIterator`.
 type QueryResultIteratorInterface = QueryIterator

@@ -35,11 +35,7 @@ func TestRestoreUtil(t *testing.T) {
 		SSTableCompressor:            &compressors.NoCompressionCompressor{},
 	}
 
-	origEngine, err := engine2.NewStorageEngine(opts)
-	if err != nil {
-		t.Fatalf("Failed to create original engine: %v", err)
-	}
-	origEngine.Start()
+	origEngine := setupEngineStart(t, opts)
 
 	// Add some data
 	metric := "restore.test"
@@ -85,11 +81,7 @@ func TestRestoreUtil(t *testing.T) {
 		WALSyncMode:                  core.WALSyncAlways,
 		Logger:                       slog.Default(),
 	}
-	restoredEngine, err := engine2.NewStorageEngine(restoredOpts)
-	if err != nil {
-		t.Fatalf("Failed to open restored engine: %v", err)
-	}
-	restoredEngine.Start()
+	restoredEngine := setupEngineStart(t, restoredOpts)
 	defer restoredEngine.Close()
 
 	// Verify the data exists

@@ -47,9 +47,7 @@ func TestWALRecovery_Successful(t *testing.T) {
 	})
 
 	// Phase 2: start an engine to recover
-	engine2, err := NewStorageEngine(opts)
-	require.NoError(t, err)
-	require.NoError(t, engine2.Start())
+	engine2 := setupStorageEngineStart(t, opts)
 	defer engine2.Close()
 
 	// Sequence number should be 7 (5 puts + 1 delete + 1 deleteSeries)

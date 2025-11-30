@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
-	"expvar"
 	"fmt"
 	"io"
 	"io/fs"
@@ -68,6 +67,8 @@ type Engine2Adapter struct {
 	seriesIDStore     indexer.SeriesIDStoreInterface
 	tagIndexManager   indexer.TagIndexManagerInterface
 	tagIndexManagerMu sync.RWMutex
+	// tagIndexImpl records which implementation was chosen: "v2" or "legacy".
+	tagIndexImpl string
 	// levels manager used by snapshot manager (best-effort)
 	levelsMgr levels.Manager
 	// simple startup flag
@@ -229,8 +230,36 @@ func NewEngine2AdapterWithHooks(e *Engine2, hm hooks.HookManager) *Engine2Adapte
 		timOpts.EnableSSTablePreallocate = e.options.EnableSSTablePreallocate
 		timOpts.SSTableRestartPointInterval = e.options.SSTableRestartPointInterval
 		timOpts.SSTablePreallocMultiplier = e.options.SSTablePreallocMultiplier
-		if tim, err := indexer.NewTagIndexManager(timOpts, deps, slog.Default(), nil); err == nil {
-			a.tagIndexManager = tim
+		// Provide a scoped logger and a tracer to the TagIndexManager so its
+		// internal SSTable writer factory receives the correct tracing and
+		// logging context. This allows index SSTables to inherit engine-level
+		// settings such as preallocation and tracing hooks via writer options.
+		timLogger := slog.Default().With("component", "Engine2Adapter-TagIndexManager")
+		timTracer := trace.NewNoopTracerProvider().Tracer("engine2.tagindex")
+		// Allow tests to force fallback to the legacy manager via env var.
+		if os.Getenv("NEXUSBASE_TEST_FORCE_TAGINDEX_FALLBACK") == "1" {
+			slog.Default().Info("Engine2Adapter: test-forced fallback enabled")
+			slog.Default().Info("Engine2Adapter: attempting to create legacy TagIndexManager")
+			if tim, err := indexer.NewTagIndexManager(timOpts, deps, timLogger, timTracer); err == nil {
+				a.tagIndexManager = tim
+				a.tagIndexImpl = "legacy"
+				slog.Default().Info("Engine2Adapter: selected tag index impl", "impl", a.tagIndexImpl)
+			} else {
+				slog.Default().Info("Engine2Adapter: legacy TagIndexManager constructor returned error", "error", err)
+			}
+		} else {
+			slog.Default().Info("Engine2Adapter: attempting to create TagIndexManager2 (v2)")
+			// Prefer the new TagIndexManager2 implementation for engine2.
+			if tim2, err := indexer.NewTagIndexManager2(timOpts, deps, timLogger, timTracer); err == nil {
+				a.tagIndexManager = tim2
+				a.tagIndexImpl = "v2"
+				slog.Default().Info("Engine2Adapter: selected tag index impl", "impl", a.tagIndexImpl)
+			} else if tim, err := indexer.NewTagIndexManager(timOpts, deps, timLogger, timTracer); err == nil {
+				// Fallback to the legacy implementation if the v2 manager fails to initialize.
+				a.tagIndexManager = tim
+				a.tagIndexImpl = "legacy"
+				slog.Default().Info("Engine2Adapter: selected tag index impl", "impl", a.tagIndexImpl)
+			}
 		}
 	}
 
@@ -278,8 +307,11 @@ func NewEngine2AdapterWithHooks(e *Engine2, hm hooks.HookManager) *Engine2Adapte
 	}
 
 	// seed id allocator. Prefer persisted value; otherwise scan sstables dir for max ID
-	// and use max(maxID+1, now).
-	nowID := uint64(time.Now().UnixNano())
+	// and use a small sequential start. Previously we seeded from the current
+	// time (nanoseconds) which produced very large IDs; use 1 as the default
+	// starting point so SSTable IDs are compact and predictable on fresh data
+	// directories. Persisted or discovered (scan) values still take precedence.
+	nowID := uint64(1)
 	var initial uint64 = nowID
 	if a.GetDataDir() != "" {
 		if v, err := loadPersistedNextSSTableID(a.GetDataDir()); err == nil && v > 0 {
@@ -480,10 +512,17 @@ func (a *Engine2Adapter) Put(ctx context.Context, point core.DataPoint) error {
 
 		// Publish a realtime update for subscribers (best-effort)
 		if ps, _ := a.GetPubSub(); ps != nil {
+			var tagsCopy map[string]string
+			if point.Tags != nil {
+				tagsCopy = make(map[string]string, len(point.Tags))
+				for k, v := range point.Tags {
+					tagsCopy[k] = v
+				}
+			}
 			upd := &tsdb.DataPointUpdate{
 				UpdateType: tsdb.DataPointUpdate_PUT,
 				Metric:     point.Metric,
-				Tags:       point.Tags,
+				Tags:       tagsCopy,
 				Timestamp:  point.Timestamp,
 			}
 			ps.Publish(upd)
@@ -548,10 +587,17 @@ func (a *Engine2Adapter) Put(ctx context.Context, point core.DataPoint) error {
 
 		// Publish a realtime update for subscribers (best-effort)
 		if ps, _ := a.GetPubSub(); ps != nil {
+			var tagsCopy map[string]string
+			if point.Tags != nil {
+				tagsCopy = make(map[string]string, len(point.Tags))
+				for k, v := range point.Tags {
+					tagsCopy[k] = v
+				}
+			}
 			upd := &tsdb.DataPointUpdate{
 				UpdateType: tsdb.DataPointUpdate_PUT,
 				Metric:     point.Metric,
-				Tags:       point.Tags,
+				Tags:       tagsCopy,
 				Timestamp:  point.Timestamp,
 			}
 			ps.Publish(upd)
@@ -587,10 +633,117 @@ func (a *Engine2Adapter) Put(ctx context.Context, point core.DataPoint) error {
 // delegates to Put for each point. It preserves ordering and stops on the
 // first error.
 func (a *Engine2Adapter) PutBatch(ctx context.Context, points []core.DataPoint) error {
-	for _, p := range points {
-		if err := a.Put(ctx, p); err != nil {
-			return err
+	// Fast-path: try to encode all points to WALEntries so we can AppendBatch
+	// in a single WAL commit. If any point fails to encode to an id-encoded
+	// WALEntry, fall back to the per-point Put implementation to preserve
+	// ordering and semantics.
+	if a == nil {
+		return fmt.Errorf("nil adapter")
+	}
+
+	entries := make([]core.WALEntry, 0, len(points))
+	// create a single Validator for the batch to avoid repeated allocations
+	v := core.NewValidator()
+	for i := range points {
+		p := &points[i]
+		// Validate metric name and tag keys/values before attempting to
+		// encode. This preserves previous validation semantics where a
+		// bad metric/tag resulted in a ValidationError returned to the
+		// caller.
+		if vErr := core.ValidateMetricAndTags(v, p.Metric, p.Tags); vErr != nil {
+			return vErr
 		}
+
+		e, encErr := a.encodeDataPointToWALEntry(p)
+		if encErr != nil {
+			// Fallback: preserve previous behavior (stop on first error)
+			for _, pp := range points {
+				if err := a.Put(ctx, pp); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		// allocate sequence number for this logical entry and record it
+		seq := a.sequenceNumber.Add(1)
+		e.SeqNum = seq
+		entries = append(entries, *e)
+	}
+
+	// Append all entries in a single WAL commit. This reduces commit/IO
+	// overhead dramatically compared to issuing one Append per entry.
+	if err := a.wal.AppendBatch(entries); err != nil {
+		if a.metrics != nil {
+			a.metrics.PutErrorsTotal.Add(int64(len(entries)))
+			a.metrics.RecomputeIngestionRatio()
+		}
+		return fmt.Errorf("wal append batch failed: %w", err)
+	}
+	if a.metrics != nil {
+		a.metrics.WALEntriesWrittenTotal.Add(int64(len(entries)))
+	}
+
+	// If leaderWal is distinct, append there too (best-effort duplicate avoidance)
+	if a.leaderWal != nil {
+		if lw, ok := a.leaderWal.(*engine2WALWrapper); ok {
+			if lw.w != a.wal {
+				_ = lw.AppendBatch(entries)
+			}
+		} else {
+			// Unknown concrete type: try AppendBatch, fall back to Append
+			if err := a.leaderWal.AppendBatch(entries); err != nil {
+				// Best-effort: try per-entry append if batch append unsupported
+				for i := range entries {
+					_ = a.leaderWal.Append(entries[i])
+				}
+			}
+		}
+	}
+
+	// Apply entries to memtable and ancillary structures
+	for i := range entries {
+		ent := &entries[i]
+		_ = a.mem.PutRaw(ent.Key, ent.Value, ent.EntryType, ent.SeqNum)
+
+		if len(ent.Key) >= 8 {
+			seriesKey := ent.Key[:len(ent.Key)-8]
+			seriesKeyStr := string(seriesKey)
+			a.addActiveSeries(seriesKeyStr)
+			if a.seriesIDStore != nil {
+				sid, _ := a.seriesIDStore.GetOrCreateID(seriesKeyStr)
+				if a.tagIndexManager != nil {
+					if _, pairs, derr := core.DecodeSeriesKey(seriesKey); derr == nil {
+						_ = a.tagIndexManager.AddEncoded(sid, pairs)
+					}
+				}
+			}
+		}
+
+		// Publish realtime update per datapoint (best-effort)
+		if ps, _ := a.GetPubSub(); ps != nil {
+			// Publish the same minimal update used by single-Put so
+			// subscribers receive metric/tag/timestamp information and
+			// filters can match correctly.
+			var tagsCopy map[string]string
+			if points[i].Tags != nil {
+				tagsCopy = make(map[string]string, len(points[i].Tags))
+				for k, v := range points[i].Tags {
+					tagsCopy[k] = v
+				}
+			}
+			upd := &tsdb.DataPointUpdate{
+				UpdateType: tsdb.DataPointUpdate_PUT,
+				Metric:     points[i].Metric,
+				Tags:       tagsCopy,
+				Timestamp:  points[i].Timestamp,
+			}
+			ps.Publish(upd)
+		}
+	}
+
+	if a.metrics != nil {
+		a.metrics.PutTotal.Add(int64(len(entries)))
+		a.metrics.RecomputeIngestionRatio()
 	}
 	return nil
 }
@@ -1254,6 +1407,23 @@ type engine2QueryResultIterator struct {
 	startTime    time.Time
 }
 
+// Ownership note:
+// - `At()` on this iterator returns a pooled `*core.QueryResultItem` to avoid
+//   per-item allocations. The returned item contains maps (`Tags`,
+//   `AggregatedValues`) and `Fields` which reference pooled memory. Callers
+//   MUST call `Put(item)` when finished and MUST NOT retain references to
+//   the item's maps or fields after calling `Put` or advancing the iterator.
+// - To retain a stable copy, callers should use `AtValue()` which returns a
+//   deep value-copy, or explicitly copy the maps/FieldValues before calling
+//   `Put(item)`.
+
+// pool for QueryResultItem to reduce per-result allocations
+var queryResultItemPool sync.Pool
+
+func init() {
+	queryResultItemPool.New = func() interface{} { return &core.QueryResultItem{} }
+}
+
 func (it *engine2QueryResultIterator) Next() bool {
 	ok := it.underlying.Next()
 	if !ok {
@@ -1272,32 +1442,14 @@ func (it *engine2QueryResultIterator) Close() error {
 	if !it.startTime.IsZero() && it.engine != nil {
 		duration := it.engine.clk.Now().Sub(it.startTime).Seconds()
 		if metrics, merr := it.engine.Metrics(); merr == nil && metrics != nil {
-			// Update QueryLatencyHist (expvar.Map of buckets with "count" and "sum")
+			// Update QueryLatencyHist (use observeLatency so buckets are updated)
 			if qh := metrics.QueryLatencyHist; qh != nil {
-				if ci := qh.Get("count"); ci != nil {
-					if ciInt, ok := ci.(*expvar.Int); ok {
-						ciInt.Add(1)
-					}
-				}
-				if s := qh.Get("sum"); s != nil {
-					if sf, ok := s.(*expvar.Float); ok {
-						sf.Set(sf.Value() + duration)
-					}
-				}
+				observeLatency(qh, duration)
 			}
 			// Update aggregation histogram when this was an aggregation query
 			if it.queryReqInfo != nil && len(it.queryReqInfo.AggregationSpecs) > 0 {
 				if ah := metrics.AggregationQueryLatencyHist; ah != nil {
-					if ac := ah.Get("count"); ac != nil {
-						if acInt, ok := ac.(*expvar.Int); ok {
-							acInt.Add(1)
-						}
-					}
-					if s := ah.Get("sum"); s != nil {
-						if sf, ok := s.(*expvar.Float); ok {
-							sf.Set(sf.Value() + duration)
-						}
-					}
+					observeLatency(ah, duration)
 				}
 			}
 		}
@@ -1310,7 +1462,29 @@ func (it *engine2QueryResultIterator) UnderlyingAt() (*core.IteratorNode, error)
 }
 
 func (it *engine2QueryResultIterator) Put(item *core.QueryResultItem) {
-	// no-op for now
+	if item == nil {
+		return
+	}
+	// Clear maps and fields to avoid holding references
+	if item.Tags != nil {
+		for k := range item.Tags {
+			delete(item.Tags, k)
+		}
+		// keep map for reuse
+	}
+	if item.Fields != nil {
+		// Attempt to return pooled FieldValues if possible; otherwise clear
+		core.PutPooledFieldValues(item.Fields)
+		item.Fields = nil
+	}
+	item.Metric = ""
+	item.Timestamp = 0
+	item.IsAggregated = false
+	item.WindowStartTime = 0
+	item.WindowEndTime = 0
+	item.IsEvent = false
+	item.AggregatedValues = nil
+	queryResultItemPool.Put(item)
 }
 
 func (it *engine2QueryResultIterator) At() (*core.QueryResultItem, error) {
@@ -1352,29 +1526,44 @@ func (it *engine2QueryResultIterator) At() (*core.QueryResultItem, error) {
 		return nil, fmt.Errorf("metric ID %d not found in string store", metricID)
 	}
 	// Temporary iterator-side diagnostic to help capture iterator view of
-	// the stored value for the failing Windows reproducer. This logs a
-	// compact hex representation of the iterator-observed value along with
-	// basic metadata so we can correlate against post-Put memtable dumps.
-	var valueHex string
-	if len(value) > 0 {
-		valueHex = hex.EncodeToString(value)
+	// the stored value for reproducer debugging. Only compute the hex
+	// representation when debug logging is enabled to avoid expensive
+	// allocations in normal runs.
+	if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
+		var valueHex string
+		if len(value) > 0 {
+			valueHex = hex.EncodeToString(value)
+		}
+		slog.Default().Debug("QUERY-DBG",
+			"adapter_id", it.engine.adapterID,
+			"metric", metric,
+			"metric_id", metricID,
+			"key_len", len(key),
+			"value_len", len(value),
+			"value_hex", valueHex,
+			"entry_type", cur.EntryType,
+		)
 	}
-	slog.Default().Debug("QUERY-DBG",
-		"adapter_id", it.engine.adapterID,
-		"metric", metric,
-		"metric_id", metricID,
-		"key_len", len(key),
-		"value_len", len(value),
-		"value_hex", valueHex,
-		"entry_type", cur.EntryType,
-	)
 	allTags := make(map[string]string, len(encodedTags))
 	for _, pair := range encodedTags {
 		tagK, _ := it.engine.stringStore.GetString(pair.KeyID)
 		tagV, _ := it.engine.stringStore.GetString(pair.ValueID)
 		allTags[tagK] = tagV
 	}
-	result := &core.QueryResultItem{Metric: metric, Tags: allTags}
+	// obtain a pooled QueryResultItem to avoid allocations
+	result := queryResultItemPool.Get().(*core.QueryResultItem)
+	// ensure tags map capacity / reset
+	if result.Tags == nil || len(result.Tags) < len(allTags) {
+		result.Tags = make(map[string]string, len(allTags))
+	} else {
+		for k := range result.Tags {
+			delete(result.Tags, k)
+		}
+	}
+	for k, v := range allTags {
+		result.Tags[k] = v
+	}
+	result.Metric = metric
 	if it.isFinalAgg {
 		aggValues, err := core.DecodeAggregationResult(value)
 		if err != nil {
@@ -1673,60 +1862,11 @@ func (a *Engine2Adapter) VerifyDataConsistency() []error {
 		}
 	}
 
-	// Additionally, scan legacy and current sstable locations so tests that
-	// place SST files under `sst/` (legacy) or `sstables/` are verified even
-	// when no manifest entries exist. Track processed paths to avoid
-	// duplicate checks for files already covered by the manifest above.
-	processed := make(map[string]struct{})
-	if a.manifestMgr != nil {
-		for _, e := range a.manifestMgr.ListEntries() {
-			processed[filepath.Clean(e.FilePath)] = struct{}{}
-		}
-	}
-	// Determine data root for scanning
-	dataRoot := ""
-	if a.Engine2 != nil {
-		dataRoot = a.Engine2.GetDataRoot()
-	}
-	scanDirs := []string{}
-	if dataRoot != "" {
-		scanDirs = append(scanDirs, filepath.Join(dataRoot, "sst"))
-		scanDirs = append(scanDirs, filepath.Join(dataRoot, "sstables"))
-	}
-	for _, dir := range scanDirs {
-		entries, err := os.ReadDir(dir)
-		if err != nil {
-			continue
-		}
-		for _, f := range entries {
-			if f.IsDir() || !strings.HasSuffix(f.Name(), ".sst") {
-				continue
-			}
-			fp := filepath.Join(dir, f.Name())
-			if _, seen := processed[filepath.Clean(fp)]; seen {
-				continue
-			}
-			// Try to parse numeric id from filename if possible, fallback to 0
-			id := uint64(0)
-			if idStr := strings.TrimSuffix(f.Name(), ".sst"); idStr != "" {
-				if v, perr := strconv.ParseUint(idStr, 10, 64); perr == nil {
-					id = v
-				}
-			}
-			loadOpts := sstable.LoadSSTableOptions{FilePath: fp, ID: id}
-			tbl, lerr := sstable.LoadSSTable(loadOpts)
-			if lerr != nil {
-				out = append(out, fmt.Errorf("failed to load sstable %s: %w", fp, lerr))
-				continue
-			}
-			if terrs := tbl.VerifyIntegrity(true); len(terrs) > 0 {
-				for _, te := range terrs {
-					out = append(out, fmt.Errorf("sstable %s: %w", tbl.FilePath(), te))
-				}
-			}
-			_ = tbl.Close()
-		}
-	}
+	// No directory scanning: manifest entries are the single source of truth
+	// for SSTables. Scanning filesystem directories (scandir) is intentionally
+	// disabled to avoid ambiguous/duplicate discovery and to ensure that the
+	// manifest remains authoritative. Tests and tools should register SST
+	// files with the manifest when they need to be verified.
 
 	// Ask levels manager to verify structural consistency as well
 	if lm := a.GetLevelsManager(); lm != nil {
@@ -1813,7 +1953,6 @@ func (a *Engine2Adapter) isDataDirNonEmpty() bool {
 	// check known paths for presence of files/directories indicating non-empty DB
 	checkPaths := []string{
 		filepath.Join(dataDir, "sstables"),
-		filepath.Join(dataDir, "sst"),
 		filepath.Join(dataDir, "wal"),
 		filepath.Join(dataDir, "index_sst"),
 		filepath.Join(dataDir, "string_mapping.log"),

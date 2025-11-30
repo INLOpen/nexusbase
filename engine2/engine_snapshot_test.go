@@ -24,10 +24,7 @@ func TestEngine_SnapshotAndRestore(t *testing.T) {
 	sourceOpts.WALSyncMode = core.WALSyncAlways
 	sourceOpts.DataDir = sourceDir
 
-	sourceEngine, err := NewStorageEngine(sourceOpts)
-	require.NoError(t, err)
-	err = sourceEngine.Start()
-	require.NoError(t, err)
+	sourceEngine := setupStorageEngineStart(t, sourceOpts)
 
 	// Put some data into the source engine
 	dp1 := HelperDataPoint(t, "metric.snap", map[string]string{"id": "a"}, 100, map[string]interface{}{"value": 10.0})
@@ -55,10 +52,7 @@ func TestEngine_SnapshotAndRestore(t *testing.T) {
 	destOpts.WALSyncMode = core.WALSyncAlways
 	destOpts.DataDir = destDir
 
-	destEngine, err := NewStorageEngine(destOpts)
-	require.NoError(t, err)
-	err = destEngine.Start()
-	require.NoError(t, err)
+	destEngine := setupStorageEngineStart(t, destOpts)
 
 	// Put some conflicting/different data
 	dp3 := HelperDataPoint(t, "metric.other", map[string]string{"id": "c"}, 300, map[string]interface{}{"value": 30.0})
@@ -69,10 +63,7 @@ func TestEngine_SnapshotAndRestore(t *testing.T) {
 	require.NoError(t, err)
 
 	// After restore, create a new engine instance to load the restored state.
-	restartedEngine, err := NewStorageEngine(destOpts)
-	require.NoError(t, err)
-	err = restartedEngine.Start()
-	require.NoError(t, err)
+	restartedEngine := setupStorageEngineStart(t, destOpts)
 	defer restartedEngine.Close()
 
 	// --- Phase 4: Verification ---
@@ -98,10 +89,7 @@ func TestEngine_RestoreFromSnapshot_NoOverwrite(t *testing.T) {
 	sourceOpts := GetBaseOptsForTest(t, "test")
 	sourceOpts.WALSyncMode = core.WALSyncAlways
 	sourceOpts.DataDir = sourceDir
-	sourceEngine, err := NewStorageEngine(sourceOpts)
-	require.NoError(t, err)
-	err = sourceEngine.Start()
-	require.NoError(t, err)
+	sourceEngine := setupStorageEngineStart(t, sourceOpts)
 	require.NoError(t, sourceEngine.Put(ctx, HelperDataPoint(t, "metric.a", nil, 1, map[string]interface{}{"value": 1.0})))
 	snapshotPath, err := sourceEngine.CreateSnapshot(ctx)
 	require.NoError(t, err)
@@ -111,10 +99,7 @@ func TestEngine_RestoreFromSnapshot_NoOverwrite(t *testing.T) {
 	destDir := t.TempDir()
 	destOpts := GetBaseOptsForTest(t, "test")
 	destOpts.DataDir = destDir
-	destEngine, err := NewStorageEngine(destOpts)
-	require.NoError(t, err)
-	err = destEngine.Start()
-	require.NoError(t, err)
+	destEngine := setupStorageEngineStart(t, destOpts)
 	defer destEngine.Close()
 
 	// Make the destination non-empty
@@ -144,10 +129,7 @@ func TestEngine_RestoreFromSnapshot_ErrorHandling(t *testing.T) {
 		sourceOpts := GetBaseOptsForTest(t, "test")
 		sourceOpts.WALSyncMode = core.WALSyncAlways
 		sourceOpts.DataDir = sourceDir
-		sourceEngine, err := NewStorageEngine(sourceOpts)
-		require.NoError(t, err)
-		err = sourceEngine.Start()
-		require.NoError(t, err)
+		sourceEngine := setupStorageEngineStart(t, sourceOpts)
 
 		// Put one point to make the snapshot non-trivial
 		require.NoError(t, sourceEngine.Put(ctx, HelperDataPoint(t, "metric.a", nil, 1, map[string]interface{}{"value": 1.0})))
@@ -165,10 +147,7 @@ func TestEngine_RestoreFromSnapshot_ErrorHandling(t *testing.T) {
 		destDir := t.TempDir()
 		destOpts := GetBaseOptsForTest(t, "test")
 		destOpts.DataDir = destDir
-		destEngine, err := NewStorageEngine(destOpts)
-		require.NoError(t, err)
-		err = destEngine.Start()
-		require.NoError(t, err)
+		destEngine := setupStorageEngineStart(t, destOpts)
 		return destEngine, func() { destEngine.Close() }
 	}
 

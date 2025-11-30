@@ -21,11 +21,10 @@ const localMaxFlushRetries = 3
 func Test_MoveToDLQ(t *testing.T) {
 	t.Run("Success_WithData", func(t *testing.T) {
 		dir := t.TempDir()
-		ai, err := NewStorageEngine(StorageEngineOptions{DataDir: dir})
-		require.NoError(t, err)
+		ai := setupStorageEngineStart(t, StorageEngineOptions{DataDir: dir})
 		a := ai.(*Engine2Adapter)
-		require.NoError(t, a.Start())
 		defer a.Close()
+		var err error
 
 		mem := memtable.NewMemtable2(1024, a.clk)
 		// Use DataPoint-centric API for Memtable2
@@ -48,11 +47,10 @@ func Test_MoveToDLQ(t *testing.T) {
 
 	t.Run("Success_EmptyMemtable", func(t *testing.T) {
 		dir := t.TempDir()
-		ai, err := NewStorageEngine(StorageEngineOptions{DataDir: dir})
-		require.NoError(t, err)
+		ai := setupStorageEngineStart(t, StorageEngineOptions{DataDir: dir})
 		a := ai.(*Engine2Adapter)
-		require.NoError(t, a.Start())
 		defer a.Close()
+		var err error
 
 		mem := memtable.NewMemtable2(1024, a.clk)
 
@@ -70,11 +68,10 @@ func Test_MoveToDLQ(t *testing.T) {
 
 	t.Run("Failure_DLQDirNotConfigured", func(t *testing.T) {
 		dir := t.TempDir()
-		ai, err := NewStorageEngine(StorageEngineOptions{DataDir: dir})
-		require.NoError(t, err)
+		ai := setupStorageEngineStart(t, StorageEngineOptions{DataDir: dir})
 		a := ai.(*Engine2Adapter)
-		require.NoError(t, a.Start())
 		defer a.Close()
+		var err error
 
 		// Simulate not configured by clearing engine data root
 		a.Engine2 = &Engine2{} // zero-value Engine2 -> GetDataRoot() should be empty
@@ -93,11 +90,10 @@ func Test_MoveToDLQ(t *testing.T) {
 func Test_ProcessImmutableUsingAdapter(t *testing.T) {
 	t.Run("Success_FirstTry", func(t *testing.T) {
 		dir := t.TempDir()
-		ai, err := NewStorageEngine(StorageEngineOptions{DataDir: dir})
-		require.NoError(t, err)
+		ai := setupStorageEngineStart(t, StorageEngineOptions{DataDir: dir})
 		a := ai.(*Engine2Adapter)
-		require.NoError(t, a.Start())
 		defer a.Close()
+		var err error
 
 		mem := memtable.NewMemtable2(1024, a.clk)
 		pv, _ := core.NewPointValue("v")
@@ -116,11 +112,10 @@ func Test_ProcessImmutableUsingAdapter(t *testing.T) {
 
 	t.Run("Success_AfterOneRetry", func(t *testing.T) {
 		dir := t.TempDir()
-		ai, err := NewStorageEngine(StorageEngineOptions{DataDir: dir})
-		require.NoError(t, err)
+		ai := setupStorageEngineStart(t, StorageEngineOptions{DataDir: dir})
 		a := ai.(*Engine2Adapter)
-		require.NoError(t, a.Start())
 		defer a.Close()
+		var err error
 
 		// Fail once, then succeed
 		a.TestingOnlyFailFlushCount = new(atomic.Int32)
@@ -138,11 +133,10 @@ func Test_ProcessImmutableUsingAdapter(t *testing.T) {
 
 	t.Run("Failure_MovesToDLQ", func(t *testing.T) {
 		dir := t.TempDir()
-		ai, err := NewStorageEngine(StorageEngineOptions{DataDir: dir})
-		require.NoError(t, err)
+		ai := setupStorageEngineStart(t, StorageEngineOptions{DataDir: dir})
 		a := ai.(*Engine2Adapter)
-		require.NoError(t, a.Start())
 		defer a.Close()
+		var err error
 
 		// Fail max times
 		a.TestingOnlyFailFlushCount = new(atomic.Int32)
@@ -167,10 +161,8 @@ func Test_ProcessImmutableUsingAdapter(t *testing.T) {
 
 	t.Run("Failure_RequeuedOnShutdown", func(t *testing.T) {
 		dir := t.TempDir()
-		ai, err := NewStorageEngine(StorageEngineOptions{DataDir: dir})
-		require.NoError(t, err)
+		ai := setupStorageEngineStart(t, StorageEngineOptions{DataDir: dir})
 		a := ai.(*Engine2Adapter)
-		require.NoError(t, a.Start())
 		defer a.Close()
 
 		a.TestingOnlyFailFlushCount = new(atomic.Int32)

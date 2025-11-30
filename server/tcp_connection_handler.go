@@ -217,7 +217,32 @@ func (h *TCPConnectionHandler) handleStreamedQuery(ctx context.Context, w io.Wri
 			return
 		}
 
-		// Send one row at a time
+		// Copy tags/fields/aggregates out of the pooled item before encoding
+		var tagsCopy map[string]string
+		if item.Tags != nil {
+			tagsCopy = make(map[string]string, len(item.Tags))
+			for k, v := range item.Tags {
+				tagsCopy[k] = v
+			}
+		}
+
+		var fieldsCopy core.FieldValues
+		if item.Fields != nil {
+			fieldsCopy = make(core.FieldValues, len(item.Fields))
+			for k, v := range item.Fields {
+				fieldsCopy[k] = v
+			}
+		}
+
+		var aggCopy map[string]float64
+		if item.AggregatedValues != nil {
+			aggCopy = make(map[string]float64, len(item.AggregatedValues))
+			for k, v := range item.AggregatedValues {
+				aggCopy[k] = v
+			}
+		}
+
+		// Send one row at a time using the copies so we don't encode pooled maps
 		buf := core.BufferPool.Get()
 		nbql.EncodeQueryResponse(buf, nbql.QueryResponse{
 			Status: nbql.ResponseDataRow,
@@ -226,10 +251,10 @@ func (h *TCPConnectionHandler) handleStreamedQuery(ctx context.Context, w io.Wri
 				{
 					// TODO: Implement SequenceID when available from the engine.
 					// SequenceID: item.SequenceID,
-					Tags:             item.Tags,
+					Tags:             tagsCopy,
 					Timestamp:        item.Timestamp,
-					Fields:           item.Fields,
-					AggregatedValues: item.AggregatedValues,
+					Fields:           fieldsCopy,
+					AggregatedValues: aggCopy,
 				},
 			},
 		})

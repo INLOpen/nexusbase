@@ -10,10 +10,7 @@ import (
 
 func TestQueryAndDeletes(t *testing.T) {
 	dir := t.TempDir()
-	a, err := NewStorageEngine(StorageEngineOptions{DataDir: dir})
-	if err != nil {
-		t.Fatalf("NewStorageEngine failed: %v", err)
-	}
+	a := setupStorageEngineStart(t, StorageEngineOptions{DataDir: dir})
 	defer a.Close()
 	ad := a
 

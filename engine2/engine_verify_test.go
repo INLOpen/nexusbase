@@ -92,9 +92,7 @@ func TestStorageEngine_VerifyDataConsistency_Port(t *testing.T) {
 		require.NoError(t, os.WriteFile(validSSTPath, fileData, 0644))
 
 		// Start engine and run VerifyDataConsistency
-		engine, err := NewStorageEngine(opts)
-		require.NoError(t, err)
-		require.NoError(t, engine.Start())
+		engine := setupStorageEngineStart(t, opts)
 		defer engine.Close()
 
 		errs := engine.VerifyDataConsistency()
@@ -156,10 +154,8 @@ func TestStorageEngine_VerifyDataConsistency_Port(t *testing.T) {
 
 		// Now open the target engine adapter and Start it so the startup path
 		// will reload the manifest and register discovered SSTables into L1.
-		ai, err := NewStorageEngine(StorageEngineOptions{DataDir: opts.DataDir})
-		require.NoError(t, err)
+		ai := setupStorageEngineStart(t, StorageEngineOptions{DataDir: opts.DataDir})
 		a := ai.(*Engine2Adapter)
-		require.NoError(t, a.Start())
 		defer a.Close()
 
 		errs := a.GetLevelsManager().VerifyConsistency()
@@ -179,9 +175,7 @@ func TestStorageEngine_VerifyDataConsistency_Port(t *testing.T) {
 		setupOpts := localOpts
 		setupOpts.DataDir = t.TempDir()
 		setupOpts.Metrics = NewEngineMetrics(false, "verify_corrupted_index_setup_")
-		eng1, err := NewStorageEngine(setupOpts)
-		require.NoError(t, err)
-		require.NoError(t, eng1.Start())
+		eng1 := setupStorageEngineStart(t, setupOpts)
 		// Add points to create multiple blocks
 		require.NoError(t, eng1.Put(context.Background(), HelperDataPoint(t, "index.corrupt.metric", map[string]string{"id": "A"}, 100, map[string]interface{}{"value": 1.0})))
 		require.NoError(t, eng1.Put(context.Background(), HelperDataPoint(t, "index.corrupt.metric", map[string]string{"id": "B"}, 200, map[string]interface{}{"value": 2.0})))
@@ -215,10 +209,8 @@ func TestStorageEngine_VerifyDataConsistency_Port(t *testing.T) {
 
 		// Start a fresh engine and add the corrupted SSTable into its levels manager
 		// Use the engine2 runtime so we can access LevelsManager to inject the corrupted SSTable
-		ai, err := NewStorageEngine(StorageEngineOptions{DataDir: localOpts.DataDir})
-		require.NoError(t, err)
+		ai := setupStorageEngineStart(t, StorageEngineOptions{DataDir: localOpts.DataDir})
 		a := ai.(*Engine2Adapter)
-		require.NoError(t, a.Start())
 		defer a.Close()
 
 		lm := a.GetLevelsManager()

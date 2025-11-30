@@ -237,10 +237,7 @@ func setupE2ETestServerWithSecure(t *testing.T, e2eOpts e2eOptions) (func(ctx co
 		Logger:                       logger,
 	}
 
-	eng, err := engine2.NewStorageEngine(opts)
-	require.NoError(t, err)
-	err = eng.Start()
-	require.NoError(t, err)
+	eng := setupEngineStart(t, opts)
 
 	// 4. Create and start the server using the in-memory bufconn listener
 	appServer, err := NewAppServerWithListeners(eng, appCfg, logger, bufListener, nil)
@@ -1233,8 +1230,7 @@ func TestReplication_HealthCheckIntegration(t *testing.T) {
 	logger, _, err := createLogger(cfg.Logging)
 	assert.NoError(t, err)
 
-	eng, err := engine2.NewStorageEngine(engine2.StorageEngineOptions{DataDir: cfg.Engine.DataDir})
-	assert.NoError(t, err)
+	eng := setupEngineNoStart(t, engine2.StorageEngineOptions{DataDir: cfg.Engine.DataDir})
 
 	appServer, err := NewAppServerWithListeners(eng, cfg, logger, nil, nil)
 	assert.NoError(t, err)

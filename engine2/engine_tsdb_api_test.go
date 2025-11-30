@@ -371,13 +371,7 @@ func TestStorageEngine_DeletesByTimeRange(t *testing.T) {
 
 func TestStorageEngine_Query_WithAggregation(t *testing.T) {
 	opts := GetBaseOptsForTest(t, "test")
-	engine, err := NewStorageEngine(opts)
-	if err != nil {
-		t.Fatalf("NewStorageEngine failed: %v", err)
-	}
-	if err = engine.Start(); err != nil {
-		t.Fatalf("Failed to start setup engine: %v", err)
-	}
+	engine := setupStorageEngineStart(t, opts)
 	defer engine.Close()
 
 	metric := "system.load"
@@ -503,13 +497,7 @@ func TestStorageEngine_AggregationQueryLatencyMetric(t *testing.T) {
 	opts := GetBaseOptsForTest(t, "test")
 	opts.Metrics = NewEngineMetrics(false, "agglatency_tsdb_")
 
-	engine, err := NewStorageEngine(opts)
-	if err != nil {
-		t.Fatalf("NewStorageEngine failed: %v", err)
-	}
-	if err = engine.Start(); err != nil {
-		t.Fatalf("Failed to start setup engine: %v", err)
-	}
+	engine := setupStorageEngineStart(t, opts)
 	defer engine.Close()
 
 	engMetrics, errm := engine.Metrics()
@@ -563,9 +551,7 @@ func TestStorageEngine_Query_RelativeTime_And_Downsampling(t *testing.T) {
 
 	opts := GetBaseOptsForTest(t, "test")
 	opts.Clock = mockClock
-	engine, err := NewStorageEngine(opts)
-	require.NoError(t, err)
-	require.NoError(t, engine.Start())
+	engine := setupStorageEngineStart(t, opts)
 	defer engine.Close()
 
 	ctx := context.Background()

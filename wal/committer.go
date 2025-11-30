@@ -108,23 +108,11 @@ func (w *WAL) commit(records []*commitRecord) {
 
 	for i := range allEntries {
 		e := allEntries[i]
-		// encode this single entry into a pooled temporary buffer to measure size
-		bptr := w.bufPool.Get().(*[]byte)
-		tmp := (*bptr)[:0]
-		var err error
-		tmp, err = encodeEntryToSlice(&e, tmp)
-		if err != nil {
-			*bptr = (*bptr)[:0]
-			w.bufPool.Put(bptr)
-			for _, rec := range records {
-				rec.done <- err
-			}
-			return
-		}
-
-		// If adding this entry would exceed MaxSegmentSize for an empty payload and
-		// it's a single entry, return ErrRecordTooLarge.
-		entrySize := int64(len(tmp))
+		// Estimate encoded size without allocating a temporary buffer.
+		var tmpVar [binary.MaxVarintLen64]byte
+		n1 := binary.PutUvarint(tmpVar[:], uint64(len(e.Key)))
+		n2 := binary.PutUvarint(tmpVar[:], uint64(len(e.Value)))
+		entrySize := int64(1 + 8 + n1 + len(e.Key) + n2 + len(e.Value))
 		// estimated record overhead (length + checksum)
 		recordOverhead := int64(8)
 
@@ -135,9 +123,6 @@ func (w *WAL) commit(records []*commitRecord) {
 			if len(currentEntries) == 0 {
 				// Single entry alone exceeds MaxSegmentSize -> reject
 				err := fmt.Errorf("%w: record_size=%d max_segment_size=%d", core.ErrRecordTooLarge, currentPayloadSize, w.opts.MaxSegmentSize)
-				// return temporary buffer
-				*bptr = (*bptr)[:0]
-				w.bufPool.Put(bptr)
 				for _, rec := range records {
 					rec.done <- err
 				}
@@ -157,11 +142,15 @@ func (w *WAL) commit(records []*commitRecord) {
 			startNewPayload()
 		}
 
-		// append the entry to currentBuf and currentEntries
-		currentBuf = append(currentBuf, tmp...)
-		// return the temporary buffer to pool
-		*bptr = (*bptr)[:0]
-		w.bufPool.Put(bptr)
+		// append the entry directly into the current payload buffer (avoids temporary buffers)
+		var err error
+		currentBuf, err = encodeEntryToSlice(&e, currentBuf)
+		if err != nil {
+			for _, rec := range records {
+				rec.done <- err
+			}
+			return
+		}
 		currentEntries = append(currentEntries, e)
 	}
 
@@ -221,7 +210,7 @@ func (w *WAL) commit(records []*commitRecord) {
 
 		// log payload write+sync duration for diagnostics
 		payloadDur := time.Since(payloadStart)
-		slog.Default().Info("WAL: payload write+sync", "payload_index", pi, "duration_ms", payloadDur.Milliseconds(), "payload_bytes", len(payloadBytes))
+		slog.Default().Debug("WAL: payload write+sync", "payload_index", pi, "duration_ms", payloadDur.Milliseconds(), "payload_bytes", len(payloadBytes))
 
 		// If this payload requested rotation (only at end), will perform after loop
 		w.mu.Unlock()
@@ -291,7 +280,7 @@ func (w *WAL) commit(records []*commitRecord) {
 		rec.done <- finalErr
 	}
 	// update metrics and log overall commit duration for diagnostics
-	slog.Default().Info("WAL: commit processed", "records", len(records), "duration_ms", time.Since(start).Milliseconds(), "total_bytes", totalBytes, "total_entries", totalEntries)
+	slog.Default().Debug("WAL: commit processed", "records", len(records), "duration_ms", time.Since(start).Milliseconds(), "total_bytes", totalBytes, "total_entries", totalEntries)
 }
 
 // encodeEntryToSlice appends the binary encoding of a WALEntry into the provided

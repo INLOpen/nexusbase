@@ -8,16 +8,11 @@ import (
 
 func TestValidateAfterStart_Debug(t *testing.T) {
 	opts := GetBaseOptsForTest(t, "debug")
-	eng, err := NewStorageEngine(opts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := eng.Start(); err != nil {
-		t.Fatal(err)
-	}
+	eng := setupStorageEngineStart(t, opts)
 	defer eng.Close()
 
 	v := core.NewValidator()
+	var err error
 	err = core.ValidateMetricAndTags(v, "", map[string]string{"id": "A"})
 	if err == nil {
 		t.Fatalf("expected validation error after Start, got nil")

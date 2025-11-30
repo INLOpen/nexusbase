@@ -29,14 +29,8 @@ func TestReplicationAndDeleteRangeMetrics(t *testing.T) {
 	opts := GetBaseOptsForTest(t, "")
 	opts.DataDir = dataDir
 
-	ai, err := NewStorageEngine(opts)
-	if err != nil {
-		t.Fatalf("NewStorageEngine error: %v", err)
-	}
+	ai := setupStorageEngineStart(t, opts)
 	a := ai.(*Engine2Adapter)
-	if err := a.Start(); err != nil {
-		t.Fatalf("Start error: %v", err)
-	}
 	defer a.Close()
 
 	// Verify replication counters increment relative to baseline values.
@@ -82,14 +76,8 @@ func TestReplicationErrorsMetric(t *testing.T) {
 	opts := GetBaseOptsForTest(t, "")
 	opts.DataDir = dataDir
 
-	ai, err := NewStorageEngine(opts)
-	if err != nil {
-		t.Fatalf("NewStorageEngine error: %v", err)
-	}
+	ai := setupStorageEngineStart(t, opts)
 	a := ai.(*Engine2Adapter)
-	if err := a.Start(); err != nil {
-		t.Fatalf("Start error: %v", err)
-	}
 	defer a.Close()
 
 	// Replace seriesIDStore with one that errors to trigger ReplicationErrorsTotal
@@ -116,14 +104,8 @@ func TestWALRecoveryMetrics(t *testing.T) {
 
 	// Start first engine (provides metrics objects) and write WAL entries
 	// using the central WAL API so on-disk layout is deterministic.
-	ai1, err := NewStorageEngine(opts)
-	if err != nil {
-		t.Fatalf("NewStorageEngine(error): %v", err)
-	}
+	ai1 := setupStorageEngineStart(t, opts)
 	a1 := ai1.(*Engine2Adapter)
-	if err := a1.Start(); err != nil {
-		t.Fatalf("Start error: %v", err)
-	}
 
 	// write three PUT WALEntry records directly to the engine WAL directory
 	walDir := filepath.Join(dataDir, "wal")
@@ -176,14 +158,8 @@ func TestWALRecoveryMetrics(t *testing.T) {
 	}
 
 	// Start a fresh engine pointing at same data dir to trigger WAL replay
-	ai2, err := NewStorageEngine(opts)
-	if err != nil {
-		t.Fatalf("NewStorageEngine 2 error: %v", err)
-	}
+	ai2 := setupStorageEngineStart(t, opts)
 	a2 := ai2.(*Engine2Adapter)
-	if err := a2.Start(); err != nil {
-		t.Fatalf("Start 2 error: %v", err)
-	}
 	defer a2.Close()
 
 	if a2.metrics == nil || a2.metrics.WALRecoveredEntriesTotal == nil || a2.metrics.WALRecoveryDurationSeconds == nil {

@@ -15,10 +15,7 @@ import (
 func setupEngineForTest(t *testing.T) StorageEngineInterface {
 	t.Helper()
 	opts := GetBaseOptsForTest(t, "test")
-	eng, err := NewStorageEngine(opts)
-	require.NoError(t, err)
-	err = eng.Start()
-	require.NoError(t, err)
+	eng := setupStorageEngineStart(t, opts)
 	return eng
 }
 

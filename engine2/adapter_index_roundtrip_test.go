@@ -20,14 +20,8 @@ func TestAdapterFlushWritesReadableIndex(t *testing.T) {
 	dir := t.TempDir()
 
 	// create engine2 adapter via compatibility helper
-	ai, err := NewStorageEngine(StorageEngineOptions{DataDir: dir})
-	if err != nil {
-		t.Fatalf("NewStorageEngine: %v", err)
-	}
+	ai := setupStorageEngineStart(t, StorageEngineOptions{DataDir: dir})
 	a := ai.(*Engine2Adapter)
-	if err := a.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
 	defer a.Close()
 
 	// Put a few data points with non-empty FieldValues so chunk payloads are written
