@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sync"
 )
 
 type PointTypeValue byte
@@ -21,6 +22,38 @@ const (
 
 type FieldValues map[string]PointValue
 
+var (
+	// pool of FieldValues maps to reduce map allocations under heavy write load.
+	fieldValuesPool = sync.Pool{
+		New: func() interface{} { return make(FieldValues) },
+	}
+	// buffer pool for Encode to avoid allocating bytes.Buffers frequently.
+	fieldEncodeBufPool = sync.Pool{
+		New: func() interface{} { return new(bytes.Buffer) },
+	}
+)
+
+// GetPooledFieldValues returns a FieldValues map from the internal pool.
+// Caller should call PutPooledFieldValues when finished to enable reuse.
+func GetPooledFieldValues() FieldValues {
+	v := fieldValuesPool.Get()
+	if v == nil {
+		return make(FieldValues)
+	}
+	return v.(FieldValues)
+}
+
+// PutPooledFieldValues resets and returns a FieldValues map to the pool.
+func PutPooledFieldValues(fv FieldValues) {
+	if fv == nil {
+		return
+	}
+	for k := range fv {
+		delete(fv, k)
+	}
+	fieldValuesPool.Put(fv)
+}
+
 // MarshalJSON implements the json.Marshaler interface for PointValue.
 func (pv PointValue) MarshalJSON() ([]byte, error) {
 	return json.Marshal(pv.data)
@@ -28,14 +61,19 @@ func (pv PointValue) MarshalJSON() ([]byte, error) {
 
 // Encode serializes the FieldValues map into a byte slice.
 func (fv FieldValues) Encode() ([]byte, error) {
-	var buf bytes.Buffer
-	if err := binary.Write(&buf, binary.BigEndian, uint16(len(fv))); err != nil {
+	// Reuse a bytes.Buffer from the pool to avoid frequent allocations.
+	bp := fieldEncodeBufPool.Get().(*bytes.Buffer)
+	buf := bp
+	buf.Reset()
+	defer fieldEncodeBufPool.Put(bp)
+
+	if err := binary.Write(buf, binary.BigEndian, uint16(len(fv))); err != nil {
 		return nil, fmt.Errorf("failed to write field count: %w", err)
 	}
 
 	for k, v := range fv {
 		keyBytes := []byte(k)
-		if err := binary.Write(&buf, binary.BigEndian, uint16(len(keyBytes))); err != nil {
+		if err := binary.Write(buf, binary.BigEndian, uint16(len(keyBytes))); err != nil {
 			return nil, fmt.Errorf("failed to write key length for '%s': %w", k, err)
 		}
 		if _, err := buf.Write(keyBytes); err != nil {
@@ -52,7 +90,12 @@ func (fv FieldValues) Encode() ([]byte, error) {
 		}
 	}
 
-	return buf.Bytes(), nil
+	// Copy out the buffer contents to a fresh slice since callers may retain
+	// the returned slice independently of the pool. Returning buf.Bytes()
+	// directly would expose pooled backing memory.
+	out := make([]byte, buf.Len())
+	copy(out, buf.Bytes())
+	return out, nil
 }
 
 func (fv FieldValues) FromMap(data map[string]interface{}) error {
@@ -297,10 +340,16 @@ func NewFieldValuesFromMap(data map[string]interface{}) (FieldValues, error) {
 	if data == nil {
 		return nil, nil
 	}
-	fv := make(FieldValues, len(data))
+	fv := GetPooledFieldValues()
+	// ensure capacity by creating a new map when incoming size is larger
+	if len(fv) < len(data) {
+		fv = make(FieldValues, len(data))
+	}
 	for k, v := range data {
 		pv, err := NewPointValue(v)
 		if err != nil {
+			// return pooled map to avoid leak
+			PutPooledFieldValues(fv)
 			return nil, fmt.Errorf("invalid value for field '%s': %w", k, err)
 		}
 		fv[k] = pv

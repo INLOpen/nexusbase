@@ -586,10 +586,110 @@ func (a *Engine2Adapter) Put(ctx context.Context, point core.DataPoint) error {
 // delegates to Put for each point. It preserves ordering and stops on the
 // first error.
 func (a *Engine2Adapter) PutBatch(ctx context.Context, points []core.DataPoint) error {
-	for _, p := range points {
-		if err := a.Put(ctx, p); err != nil {
-			return err
+	// Fast-path: try to encode all points to WALEntries so we can AppendBatch
+	// in a single WAL commit. If any point fails to encode to an id-encoded
+	// WALEntry, fall back to the per-point Put implementation to preserve
+	// ordering and semantics.
+	if a == nil {
+		return fmt.Errorf("nil adapter")
+	}
+
+	entries := make([]core.WALEntry, 0, len(points))
+	// create a single Validator for the batch to avoid repeated allocations
+	v := core.NewValidator()
+	for i := range points {
+		p := &points[i]
+		// Validate metric name and tag keys/values before attempting to
+		// encode. This preserves previous validation semantics where a
+		// bad metric/tag resulted in a ValidationError returned to the
+		// caller.
+		if vErr := core.ValidateMetricAndTags(v, p.Metric, p.Tags); vErr != nil {
+			return vErr
 		}
+
+		e, encErr := a.encodeDataPointToWALEntry(p)
+		if encErr != nil {
+			// Fallback: preserve previous behavior (stop on first error)
+			for _, pp := range points {
+				if err := a.Put(ctx, pp); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		// allocate sequence number for this logical entry and record it
+		seq := a.sequenceNumber.Add(1)
+		e.SeqNum = seq
+		entries = append(entries, *e)
+	}
+
+	// Append all entries in a single WAL commit. This reduces commit/IO
+	// overhead dramatically compared to issuing one Append per entry.
+	if err := a.wal.AppendBatch(entries); err != nil {
+		if a.metrics != nil {
+			a.metrics.PutErrorsTotal.Add(int64(len(entries)))
+			a.metrics.RecomputeIngestionRatio()
+		}
+		return fmt.Errorf("wal append batch failed: %w", err)
+	}
+	if a.metrics != nil {
+		a.metrics.WALEntriesWrittenTotal.Add(int64(len(entries)))
+	}
+
+	// If leaderWal is distinct, append there too (best-effort duplicate avoidance)
+	if a.leaderWal != nil {
+		if lw, ok := a.leaderWal.(*engine2WALWrapper); ok {
+			if lw.w != a.wal {
+				_ = lw.AppendBatch(entries)
+			}
+		} else {
+			// Unknown concrete type: try AppendBatch, fall back to Append
+			if err := a.leaderWal.AppendBatch(entries); err != nil {
+				// Best-effort: try per-entry append if batch append unsupported
+				for i := range entries {
+					_ = a.leaderWal.Append(entries[i])
+				}
+			}
+		}
+	}
+
+	// Apply entries to memtable and ancillary structures
+	for i := range entries {
+		ent := &entries[i]
+		_ = a.mem.PutRaw(ent.Key, ent.Value, ent.EntryType, ent.SeqNum)
+
+		if len(ent.Key) >= 8 {
+			seriesKey := ent.Key[:len(ent.Key)-8]
+			seriesKeyStr := string(seriesKey)
+			a.addActiveSeries(seriesKeyStr)
+			if a.seriesIDStore != nil {
+				sid, _ := a.seriesIDStore.GetOrCreateID(seriesKeyStr)
+				if a.tagIndexManager != nil {
+					if _, pairs, derr := core.DecodeSeriesKey(seriesKey); derr == nil {
+						_ = a.tagIndexManager.AddEncoded(sid, pairs)
+					}
+				}
+			}
+		}
+
+		// Publish realtime update per datapoint (best-effort)
+		if ps, _ := a.GetPubSub(); ps != nil {
+			// Publish the same minimal update used by single-Put so
+			// subscribers receive metric/tag/timestamp information and
+			// filters can match correctly.
+			upd := &tsdb.DataPointUpdate{
+				UpdateType: tsdb.DataPointUpdate_PUT,
+				Metric:     points[i].Metric,
+				Tags:       points[i].Tags,
+				Timestamp:  points[i].Timestamp,
+			}
+			ps.Publish(upd)
+		}
+	}
+
+	if a.metrics != nil {
+		a.metrics.PutTotal.Add(int64(len(entries)))
+		a.metrics.RecomputeIngestionRatio()
 	}
 	return nil
 }
@@ -1253,6 +1353,13 @@ type engine2QueryResultIterator struct {
 	startTime    time.Time
 }
 
+// pool for QueryResultItem to reduce per-result allocations
+var queryResultItemPool sync.Pool
+
+func init() {
+	queryResultItemPool.New = func() interface{} { return &core.QueryResultItem{} }
+}
+
 func (it *engine2QueryResultIterator) Next() bool {
 	ok := it.underlying.Next()
 	if !ok {
@@ -1291,7 +1398,29 @@ func (it *engine2QueryResultIterator) UnderlyingAt() (*core.IteratorNode, error)
 }
 
 func (it *engine2QueryResultIterator) Put(item *core.QueryResultItem) {
-	// no-op for now
+	if item == nil {
+		return
+	}
+	// Clear maps and fields to avoid holding references
+	if item.Tags != nil {
+		for k := range item.Tags {
+			delete(item.Tags, k)
+		}
+		// keep map for reuse
+	}
+	if item.Fields != nil {
+		// Attempt to return pooled FieldValues if possible; otherwise clear
+		core.PutPooledFieldValues(item.Fields)
+		item.Fields = nil
+	}
+	item.Metric = ""
+	item.Timestamp = 0
+	item.IsAggregated = false
+	item.WindowStartTime = 0
+	item.WindowEndTime = 0
+	item.IsEvent = false
+	item.AggregatedValues = nil
+	queryResultItemPool.Put(item)
 }
 
 func (it *engine2QueryResultIterator) At() (*core.QueryResultItem, error) {
@@ -1333,29 +1462,44 @@ func (it *engine2QueryResultIterator) At() (*core.QueryResultItem, error) {
 		return nil, fmt.Errorf("metric ID %d not found in string store", metricID)
 	}
 	// Temporary iterator-side diagnostic to help capture iterator view of
-	// the stored value for the failing Windows reproducer. This logs a
-	// compact hex representation of the iterator-observed value along with
-	// basic metadata so we can correlate against post-Put memtable dumps.
-	var valueHex string
-	if len(value) > 0 {
-		valueHex = hex.EncodeToString(value)
+	// the stored value for reproducer debugging. Only compute the hex
+	// representation when debug logging is enabled to avoid expensive
+	// allocations in normal runs.
+	if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
+		var valueHex string
+		if len(value) > 0 {
+			valueHex = hex.EncodeToString(value)
+		}
+		slog.Default().Debug("QUERY-DBG",
+			"adapter_id", it.engine.adapterID,
+			"metric", metric,
+			"metric_id", metricID,
+			"key_len", len(key),
+			"value_len", len(value),
+			"value_hex", valueHex,
+			"entry_type", cur.EntryType,
+		)
 	}
-	slog.Default().Debug("QUERY-DBG",
-		"adapter_id", it.engine.adapterID,
-		"metric", metric,
-		"metric_id", metricID,
-		"key_len", len(key),
-		"value_len", len(value),
-		"value_hex", valueHex,
-		"entry_type", cur.EntryType,
-	)
 	allTags := make(map[string]string, len(encodedTags))
 	for _, pair := range encodedTags {
 		tagK, _ := it.engine.stringStore.GetString(pair.KeyID)
 		tagV, _ := it.engine.stringStore.GetString(pair.ValueID)
 		allTags[tagK] = tagV
 	}
-	result := &core.QueryResultItem{Metric: metric, Tags: allTags}
+	// obtain a pooled QueryResultItem to avoid allocations
+	result := queryResultItemPool.Get().(*core.QueryResultItem)
+	// ensure tags map capacity / reset
+	if result.Tags == nil || len(result.Tags) < len(allTags) {
+		result.Tags = make(map[string]string, len(allTags))
+	} else {
+		for k := range result.Tags {
+			delete(result.Tags, k)
+		}
+	}
+	for k, v := range allTags {
+		result.Tags[k] = v
+	}
+	result.Metric = metric
 	if it.isFinalAgg {
 		aggValues, err := core.DecodeAggregationResult(value)
 		if err != nil {
