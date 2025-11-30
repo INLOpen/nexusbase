@@ -366,15 +366,31 @@ func (s *GRPCServer) Query(req *tsdb.QueryRequest, stream tsdb.TSDBService_Query
 			}
 		}
 
+		// Copy tags and aggregated values so we don't reference pooled memory
+		var tagsCopy map[string]string
+		if item.Tags != nil {
+			tagsCopy = make(map[string]string, len(item.Tags))
+			for k, v := range item.Tags {
+				tagsCopy[k] = v
+			}
+		}
+		var aggCopy map[string]float64
+		if item.AggregatedValues != nil {
+			aggCopy = make(map[string]float64, len(item.AggregatedValues))
+			for k, v := range item.AggregatedValues {
+				aggCopy[k] = v
+			}
+		}
+
 		result := &tsdb.QueryResult{
 			Metric:           item.Metric,
-			Tags:             item.Tags,
+			Tags:             tagsCopy,
 			IsAggregated:     item.IsAggregated,
 			Timestamp:        item.Timestamp,
 			Fields:           fields,
 			WindowStartTime:  item.WindowStartTime,
 			WindowEndTime:    item.WindowEndTime,
-			AggregatedValues: item.AggregatedValues,
+			AggregatedValues: aggCopy,
 		}
 		iter.Put(item) // Return item to pool
 
