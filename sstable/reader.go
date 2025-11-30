@@ -22,6 +22,14 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+// noopFilter is a tiny Filter implementation used when a block-format SSTable
+// doesn't carry a Bloom filter on disk. It always returns true for Contains,
+// deferring correctness to the sparse index and disk reads.
+type noopFilter struct{}
+
+func (n *noopFilter) Contains(_ []byte) bool { return true }
+func (n *noopFilter) Bytes() []byte          { return nil }
+
 // sstable.go: Defines SSTable struct, LoadSSTable, Get, Close
 // Placeholder for SSTable structure and core logic.
 // Details to be filled based on FR4.
@@ -129,6 +137,12 @@ func LoadSSTable(opts LoadSSTableOptions) (sst *SSTable, err error) {
 	}
 
 	if header.Magic != core.SSTableMagicNumber {
+		// Not a legacy-format SSTable header. Try to detect block-level v2 format
+		// and load it via the block-format loader. This allows the system to
+		// read both legacy and block-format SSTables transparently.
+		if sst, err = loadBlockFormatSSTable(opts); err == nil {
+			return sst, nil
+		}
 		return nil, fmt.Errorf("invalid sstable magic number in %s. Got: %x, Want: %x", opts.FilePath, header.Magic, core.SSTableMagicNumber)
 	}
 	if header.Version != core.FormatVersion {
@@ -295,6 +309,309 @@ func LoadSSTable(opts LoadSSTableOptions) (sst *SSTable, err error) {
 	return sst, nil
 }
 
+// loadBlockFormatSSTable loads a block-level (v2) SSTable and adapts its
+// block index into the in-memory Index structure so the rest of the code
+// can treat it like a regular SSTable.
+func loadBlockFormatSSTable(opts LoadSSTableOptions) (sst *SSTable, err error) {
+	// Open the file
+	file, ferr := sys.Open(opts.FilePath)
+	if ferr != nil {
+		return nil, ferr
+	}
+	// Read last 64 bytes footer
+	fi, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
+	if fi.Size() < 64 {
+		file.Close()
+		return nil, fmt.Errorf("file too small to be block-format sstable: %s", opts.FilePath)
+	}
+	if _, err := file.Seek(-64, io.SeekEnd); err != nil {
+		file.Close()
+		return nil, err
+	}
+	footer := make([]byte, 64)
+	if _, err := io.ReadFull(file, footer); err != nil {
+		file.Close()
+		return nil, err
+	}
+	// parse block writer footer layout (see block_writer.go)
+	indexOffset := int64(binary.LittleEndian.Uint64(footer[0:8]))
+	indexLen := int(binary.LittleEndian.Uint32(footer[8:12]))
+	bloomOffset := int64(binary.LittleEndian.Uint64(footer[12:20]))
+	bloomLen := int(binary.LittleEndian.Uint32(footer[20:24]))
+	metaOffset := int64(binary.LittleEndian.Uint64(footer[24:32]))
+	metaLen := int(binary.LittleEndian.Uint32(footer[32:36]))
+	_ = metaOffset
+	_ = metaLen
+	// format_version := binary.LittleEndian.Uint32(footer[36:40])
+	// verify footer magic
+	magic := string(footer[56:64])
+	if magic != footerMagic {
+		file.Close()
+		return nil, fmt.Errorf("invalid block-format footer magic in %s: got %s", opts.FilePath, magic)
+	}
+
+	// read index block
+	if _, err := file.Seek(indexOffset, io.SeekStart); err != nil {
+		file.Close()
+		return nil, err
+	}
+	indexBuf := make([]byte, indexLen)
+	if _, err := io.ReadFull(file, indexBuf); err != nil {
+		file.Close()
+		return nil, err
+	}
+	// parse index entries: uvarint keylen + key + off(8) + compLen(4) + uncompLen(4)
+	off := 0
+	idx := &Index{tracer: opts.Tracer, logger: opts.Logger}
+	for off < len(indexBuf) {
+		v, n := binary.Uvarint(indexBuf[off:])
+		if n <= 0 {
+			file.Close()
+			return nil, fmt.Errorf("failed to parse index uvarint in %s", opts.FilePath)
+		}
+		off += n
+		keyLen := int(v)
+		if off+keyLen > len(indexBuf) {
+			file.Close()
+			return nil, io.ErrUnexpectedEOF
+		}
+		key := make([]byte, keyLen)
+		copy(key, indexBuf[off:off+keyLen])
+		off += keyLen
+		if off+8+4+4 > len(indexBuf) {
+			file.Close()
+			return nil, io.ErrUnexpectedEOF
+		}
+		blockOffset := int64(binary.LittleEndian.Uint64(indexBuf[off : off+8]))
+		off += 8
+		compLen := binary.LittleEndian.Uint32(indexBuf[off : off+4])
+		off += 4
+		_ = binary.LittleEndian.Uint32(indexBuf[off : off+4])
+		off += 4
+		// Disk block length includes compLen + trailer (13 bytes)
+		diskLen := compLen + 13
+		idx.entries = append(idx.entries, BlockIndexEntry{FirstKey: key, BlockOffset: blockOffset, BlockLength: diskLen})
+	}
+
+	// determine min/max keys from index
+	var minKey, maxKey []byte
+	if len(idx.entries) > 0 {
+		minKey = idx.entries[0].FirstKey
+		// Attempt to determine a proper maxKey by reading the last block and extracting its last key.
+		lastEntry := idx.entries[len(idx.entries)-1]
+		// Read the raw block (compressed payload + trailer)
+		rawBlock := make([]byte, lastEntry.BlockLength)
+		if _, err := file.ReadAt(rawBlock, lastEntry.BlockOffset); err == nil {
+			// trailer is last 13 bytes
+			if len(rawBlock) >= 13 {
+				trailer := rawBlock[len(rawBlock)-13:]
+				compType := core.CompressionType(trailer[12])
+				compressedPayload := rawBlock[:len(rawBlock)-13]
+				// Decompress
+				compressor, cerr := GetCompressor(compType)
+				if cerr == nil {
+					if dr, derr := compressor.Decompress(compressedPayload); derr == nil {
+						defer dr.Close()
+						// Read decompressed bytes
+						buf := make([]byte, 0)
+						tmp := make([]byte, 4096)
+						for {
+							n, rerr := dr.Read(tmp)
+							if n > 0 {
+								buf = append(buf, tmp[:n]...)
+							}
+							if rerr != nil {
+								if rerr == io.EOF {
+									break
+								}
+								break
+							}
+						}
+						if len(buf) > 0 {
+							blk := NewBlock(buf)
+							it := NewBlockIterator(blk.getEntriesData())
+							var lastKey []byte
+							for it.Next() {
+								lastKey = append(lastKey[:0], it.Key()...)
+							}
+							if it.Error() == nil && len(lastKey) > 0 {
+								maxKey = lastKey
+							} else {
+								maxKey = lastEntry.FirstKey
+							}
+						} else {
+							maxKey = lastEntry.FirstKey
+						}
+					} else {
+						// failed to decompress; fall back
+						maxKey = lastEntry.FirstKey
+					}
+				} else {
+					maxKey = lastEntry.FirstKey
+				}
+			} else {
+				maxKey = lastEntry.FirstKey
+			}
+		} else {
+			maxKey = lastEntry.FirstKey
+		}
+	}
+
+	// Attempt to deserialize a persisted Bloom filter if one was written by
+	// the BlockWriter. If not present or deserialization fails, fall back to
+	// reconstructing a Bloom filter by scanning all blocks.
+	var reconstructedFilter *BloomFilter
+	var persistedFilter *BloomFilter
+	if bloomLen > 0 && bloomOffset > 0 {
+		bloomData := make([]byte, bloomLen)
+		if _, err := file.ReadAt(bloomData, bloomOffset); err == nil {
+			if bf, berr := DeserializeBloomFilter(bloomData); berr == nil {
+				persistedFilter = bf
+			}
+		}
+	}
+	// If we didn't get a persisted filter, rebuild one from the blocks.
+	if persistedFilter == nil {
+		// Reconstruct an in-memory Bloom filter by scanning all data blocks and
+		// adding each key seen. This provides parity with legacy SSTables where a
+		// Bloom filter was written at write-time. The reconstruction can be
+		// expensive for very large tables, but ensures reasonable lookup pruning
+		// for block-format SSTables when no persisted filter is available.
+		allKeysCount := 0
+		// First pass: count keys to size the Bloom filter
+		for _, be := range idx.entries {
+			// read raw disk block (comp payload + 13-byte trailer)
+			raw := make([]byte, be.BlockLength)
+			if _, err := file.ReadAt(raw, be.BlockOffset); err != nil {
+				// If we cannot read a block, skip adding from this block.
+				continue
+			}
+			if len(raw) < 13 {
+				continue
+			}
+			compPayload := raw[:len(raw)-13]
+			trailer := raw[len(raw)-13:]
+			compType := core.CompressionType(trailer[12])
+			comp, cerr := GetCompressor(compType)
+			if cerr != nil {
+				continue
+			}
+			dr, derr := comp.Decompress(compPayload)
+			if derr != nil {
+				continue
+			}
+			// Read decompressed bytes and iterate entries to count keys
+			decompBuf := make([]byte, 0)
+			tmp := make([]byte, 4096)
+			for {
+				n, rerr := dr.Read(tmp)
+				if n > 0 {
+					decompBuf = append(decompBuf, tmp[:n]...)
+				}
+				if rerr != nil {
+					_ = dr.Close()
+					break
+				}
+			}
+			_ = dr.Close()
+			if len(decompBuf) == 0 {
+				continue
+			}
+			blk := NewBlock(decompBuf)
+			it := NewBlockIterator(blk.getEntriesData())
+			for it.Next() {
+				allKeysCount++
+			}
+		}
+		if allKeysCount == 0 {
+			allKeysCount = 1
+		}
+		bf, berr := NewBloomFilter(uint64(allKeysCount), 0.01)
+		if berr == nil {
+			// Second pass: actually add keys
+			for _, be := range idx.entries {
+				raw := make([]byte, be.BlockLength)
+				if _, err := file.ReadAt(raw, be.BlockOffset); err != nil {
+					continue
+				}
+				if len(raw) < 13 {
+					continue
+				}
+				compPayload := raw[:len(raw)-13]
+				trailer := raw[len(raw)-13:]
+				compType := core.CompressionType(trailer[12])
+				comp, cerr := GetCompressor(compType)
+				if cerr != nil {
+					continue
+				}
+				dr, derr := comp.Decompress(compPayload)
+				if derr != nil {
+					continue
+				}
+				decompBuf := make([]byte, 0)
+				tmp := make([]byte, 4096)
+				for {
+					n, rerr := dr.Read(tmp)
+					if n > 0 {
+						decompBuf = append(decompBuf, tmp[:n]...)
+					}
+					if rerr != nil {
+						_ = dr.Close()
+						break
+					}
+				}
+				_ = dr.Close()
+				if len(decompBuf) == 0 {
+					continue
+				}
+				blk := NewBlock(decompBuf)
+				it := NewBlockIterator(blk.getEntriesData())
+				for it.Next() {
+					k := it.Key()
+					// Add a copy of k to the bloom filter
+					kb := make([]byte, len(k))
+					copy(kb, k)
+					bf.Add(kb)
+				}
+			}
+			reconstructedFilter = bf
+		}
+	}
+
+	// Build SSTable wrapper
+	stat, _ := file.Stat()
+	fileSize := stat.Size()
+	// Prefer a reconstructed Bloom filter if available, otherwise fall back
+	// to the noopFilter to avoid short-circuiting Get() for v2 SSTables.
+	var filterToUse filter.Filter
+	if reconstructedFilter != nil {
+		filterToUse = reconstructedFilter
+	} else {
+		filterToUse = &noopFilter{}
+	}
+	sst = &SSTable{
+		file:           file,
+		filePath:       opts.FilePath,
+		id:             opts.ID,
+		index:          idx,
+		filter:         filterToUse,
+		minKey:         minKey,
+		maxKey:         maxKey,
+		size:           fileSize,
+		keyCount:       0,
+		tombstoneCount: 0,
+		dataEndOffset:  indexOffset,
+		blockCache:     opts.BlockCache,
+		tracer:         opts.Tracer,
+		logger:         opts.Logger,
+	}
+	return sst, nil
+}
+
 // Get retrieves a value and its type for a given key from the SSTable.
 // It first checks the Bloom filter, then uses the index to locate the data.
 // Returns value, core.EntryType, and an error. If not found, error will be ErrNotFound.
@@ -449,12 +766,14 @@ func (s *SSTable) readBlock(offset int64, length uint32, sem chan struct{}) (*Bl
 // readAndVerifyRawBlock reads a raw block from disk and verifies its checksum.
 // It returns the compressed data payload and its compression type.
 func (s *SSTable) readAndVerifyRawBlock(offset int64, length uint32) ([]byte, core.CompressionType, error) {
-	const compressionFlagSize = 1
-	const checksumSize = 4
-	const minBlockHeaderSize = compressionFlagSize + checksumSize
+	// There are two block layouts in the codebase:
+	// Legacy writer format: [compType (1 byte)][checksum (4 bytes)][compressed payload]
+	// V2 block writer format: [compressed payload][trailer (13 bytes)]
+	// trailer: checksum u32 | uncompLen u32 | compLen u32 | compType u8
+	const trailerSize = 13
 
-	if length < minBlockHeaderSize {
-		return nil, 0, fmt.Errorf("block length %d is too small to include compression flag and checksum (offset: %d): %w", length, offset, ErrCorrupted)
+	if length < 5 { // Must at least hold legacy compFlag + checksum
+		return nil, 0, fmt.Errorf("block length %d is too small to be valid (offset: %d): %w", length, offset, ErrCorrupted)
 	}
 
 	readBuffer := make([]byte, length)
@@ -462,16 +781,26 @@ func (s *SSTable) readAndVerifyRawBlock(offset int64, length uint32) ([]byte, co
 		return nil, 0, err
 	}
 
-	compressionTypeByte := readBuffer[0]
-	storedChecksum := binary.LittleEndian.Uint32(readBuffer[compressionFlagSize : compressionFlagSize+checksumSize])
-	compressedPayload := readBuffer[minBlockHeaderSize:]
-
-	calculatedChecksum := crc32.ChecksumIEEE(compressedPayload)
-	if storedChecksum != calculatedChecksum {
-		return nil, 0, fmt.Errorf("checksum mismatch for block at offset %d: %w", offset, ErrCorrupted)
+	// Try legacy layout first: compType at byte 0, checksum at bytes [1:5]
+	legacyCompType := readBuffer[0]
+	legacyChecksum := binary.LittleEndian.Uint32(readBuffer[1:5])
+	legacyCompressedPayload := readBuffer[5:]
+	if crc32.ChecksumIEEE(legacyCompressedPayload) == legacyChecksum {
+		return legacyCompressedPayload, core.CompressionType(legacyCompType), nil
 	}
 
-	return compressedPayload, core.CompressionType(compressionTypeByte), nil
+	// Try v2 layout: trailer at the end
+	if length < trailerSize {
+		return nil, 0, fmt.Errorf("block length %d is too small to include trailer (offset: %d): %w", length, offset, ErrCorrupted)
+	}
+	trailer := readBuffer[len(readBuffer)-trailerSize:]
+	storedChecksum := binary.LittleEndian.Uint32(trailer[0:4])
+	compType := trailer[12]
+	compressedPayload := readBuffer[:len(readBuffer)-trailerSize]
+	if crc32.ChecksumIEEE(compressedPayload) != storedChecksum {
+		return nil, 0, fmt.Errorf("checksum mismatch for block at offset %d: %w", offset, ErrCorrupted)
+	}
+	return compressedPayload, core.CompressionType(compType), nil
 }
 
 // decompressBlock takes compressed block data and returns the decompressed bytes.

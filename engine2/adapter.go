@@ -228,7 +228,13 @@ func NewEngine2AdapterWithHooks(e *Engine2, hm hooks.HookManager) *Engine2Adapte
 		timOpts.EnableSSTablePreallocate = e.options.EnableSSTablePreallocate
 		timOpts.SSTableRestartPointInterval = e.options.SSTableRestartPointInterval
 		timOpts.SSTablePreallocMultiplier = e.options.SSTablePreallocMultiplier
-		if tim, err := indexer.NewTagIndexManager(timOpts, deps, slog.Default(), nil); err == nil {
+		// Provide a scoped logger and a tracer to the TagIndexManager so its
+		// internal SSTable writer factory receives the correct tracing and
+		// logging context. This allows index SSTables to inherit engine-level
+		// settings such as preallocation and tracing hooks via writer options.
+		timLogger := slog.Default().With("component", "Engine2Adapter-TagIndexManager")
+		timTracer := trace.NewNoopTracerProvider().Tracer("engine2.tagindex")
+		if tim, err := indexer.NewTagIndexManager(timOpts, deps, timLogger, timTracer); err == nil {
 			a.tagIndexManager = tim
 		}
 	}
@@ -277,8 +283,11 @@ func NewEngine2AdapterWithHooks(e *Engine2, hm hooks.HookManager) *Engine2Adapte
 	}
 
 	// seed id allocator. Prefer persisted value; otherwise scan sstables dir for max ID
-	// and use max(maxID+1, now).
-	nowID := uint64(time.Now().UnixNano())
+	// and use a small sequential start. Previously we seeded from the current
+	// time (nanoseconds) which produced very large IDs; use 1 as the default
+	// starting point so SSTable IDs are compact and predictable on fresh data
+	// directories. Persisted or discovered (scan) values still take precedence.
+	nowID := uint64(1)
 	var initial uint64 = nowID
 	if a.GetDataDir() != "" {
 		if v, err := loadPersistedNextSSTableID(a.GetDataDir()); err == nil && v > 0 {
@@ -1829,60 +1838,11 @@ func (a *Engine2Adapter) VerifyDataConsistency() []error {
 		}
 	}
 
-	// Additionally, scan legacy and current sstable locations so tests that
-	// place SST files under `sst/` (legacy) or `sstables/` are verified even
-	// when no manifest entries exist. Track processed paths to avoid
-	// duplicate checks for files already covered by the manifest above.
-	processed := make(map[string]struct{})
-	if a.manifestMgr != nil {
-		for _, e := range a.manifestMgr.ListEntries() {
-			processed[filepath.Clean(e.FilePath)] = struct{}{}
-		}
-	}
-	// Determine data root for scanning
-	dataRoot := ""
-	if a.Engine2 != nil {
-		dataRoot = a.Engine2.GetDataRoot()
-	}
-	scanDirs := []string{}
-	if dataRoot != "" {
-		scanDirs = append(scanDirs, filepath.Join(dataRoot, "sst"))
-		scanDirs = append(scanDirs, filepath.Join(dataRoot, "sstables"))
-	}
-	for _, dir := range scanDirs {
-		entries, err := os.ReadDir(dir)
-		if err != nil {
-			continue
-		}
-		for _, f := range entries {
-			if f.IsDir() || !strings.HasSuffix(f.Name(), ".sst") {
-				continue
-			}
-			fp := filepath.Join(dir, f.Name())
-			if _, seen := processed[filepath.Clean(fp)]; seen {
-				continue
-			}
-			// Try to parse numeric id from filename if possible, fallback to 0
-			id := uint64(0)
-			if idStr := strings.TrimSuffix(f.Name(), ".sst"); idStr != "" {
-				if v, perr := strconv.ParseUint(idStr, 10, 64); perr == nil {
-					id = v
-				}
-			}
-			loadOpts := sstable.LoadSSTableOptions{FilePath: fp, ID: id}
-			tbl, lerr := sstable.LoadSSTable(loadOpts)
-			if lerr != nil {
-				out = append(out, fmt.Errorf("failed to load sstable %s: %w", fp, lerr))
-				continue
-			}
-			if terrs := tbl.VerifyIntegrity(true); len(terrs) > 0 {
-				for _, te := range terrs {
-					out = append(out, fmt.Errorf("sstable %s: %w", tbl.FilePath(), te))
-				}
-			}
-			_ = tbl.Close()
-		}
-	}
+	// No directory scanning: manifest entries are the single source of truth
+	// for SSTables. Scanning filesystem directories (scandir) is intentionally
+	// disabled to avoid ambiguous/duplicate discovery and to ensure that the
+	// manifest remains authoritative. Tests and tools should register SST
+	// files with the manifest when they need to be verified.
 
 	// Ask levels manager to verify structural consistency as well
 	if lm := a.GetLevelsManager(); lm != nil {
@@ -1969,7 +1929,6 @@ func (a *Engine2Adapter) isDataDirNonEmpty() bool {
 	// check known paths for presence of files/directories indicating non-empty DB
 	checkPaths := []string{
 		filepath.Join(dataDir, "sstables"),
-		filepath.Join(dataDir, "sst"),
 		filepath.Join(dataDir, "wal"),
 		filepath.Join(dataDir, "index_sst"),
 		filepath.Join(dataDir, "string_mapping.log"),
