@@ -1353,6 +1353,16 @@ type engine2QueryResultIterator struct {
 	startTime    time.Time
 }
 
+// Ownership note:
+// - `At()` on this iterator returns a pooled `*core.QueryResultItem` to avoid
+//   per-item allocations. The returned item contains maps (`Tags`,
+//   `AggregatedValues`) and `Fields` which reference pooled memory. Callers
+//   MUST call `Put(item)` when finished and MUST NOT retain references to
+//   the item's maps or fields after calling `Put` or advancing the iterator.
+// - To retain a stable copy, callers should use `AtValue()` which returns a
+//   deep value-copy, or explicitly copy the maps/FieldValues before calling
+//   `Put(item)`.
+
 // pool for QueryResultItem to reduce per-result allocations
 var queryResultItemPool sync.Pool
 

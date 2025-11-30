@@ -15,6 +15,13 @@ import (
 type KeyDecoder func(key []byte) (metric string, tags map[string]string, ts int64, ok bool)
 
 // memQueryIterator streams results from a top-level memtable iterator.
+// memQueryIterator streams results from a top-level memtable iterator.
+// Ownership note:
+//   - `At()` returns a pointer to an internal `core.QueryResultItem` (`it.curr`).
+//     That pointer references memory owned by the iterator and will be overwritten
+//     on the next `Next()` call. `Put()` is a no-op for this iterator. Callers
+//     that need to retain result data beyond the iterator lifetime must use
+//     `AtValue()` which returns a deep value-copy.
 type memQueryIterator struct {
 	params  core.QueryParams
 	iter    core.IteratorInterface[*core.IteratorNode]
