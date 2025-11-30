@@ -67,6 +67,8 @@ type Engine2Adapter struct {
 	seriesIDStore     indexer.SeriesIDStoreInterface
 	tagIndexManager   indexer.TagIndexManagerInterface
 	tagIndexManagerMu sync.RWMutex
+	// tagIndexImpl records which implementation was chosen: "v2" or "legacy".
+	tagIndexImpl string
 	// levels manager used by snapshot manager (best-effort)
 	levelsMgr levels.Manager
 	// simple startup flag
@@ -234,8 +236,30 @@ func NewEngine2AdapterWithHooks(e *Engine2, hm hooks.HookManager) *Engine2Adapte
 		// settings such as preallocation and tracing hooks via writer options.
 		timLogger := slog.Default().With("component", "Engine2Adapter-TagIndexManager")
 		timTracer := trace.NewNoopTracerProvider().Tracer("engine2.tagindex")
-		if tim, err := indexer.NewTagIndexManager(timOpts, deps, timLogger, timTracer); err == nil {
-			a.tagIndexManager = tim
+		// Allow tests to force fallback to the legacy manager via env var.
+		if os.Getenv("NEXUSBASE_TEST_FORCE_TAGINDEX_FALLBACK") == "1" {
+			slog.Default().Info("Engine2Adapter: test-forced fallback enabled")
+			slog.Default().Info("Engine2Adapter: attempting to create legacy TagIndexManager")
+			if tim, err := indexer.NewTagIndexManager(timOpts, deps, timLogger, timTracer); err == nil {
+				a.tagIndexManager = tim
+				a.tagIndexImpl = "legacy"
+				slog.Default().Info("Engine2Adapter: selected tag index impl", "impl", a.tagIndexImpl)
+			} else {
+				slog.Default().Info("Engine2Adapter: legacy TagIndexManager constructor returned error", "error", err)
+			}
+		} else {
+			slog.Default().Info("Engine2Adapter: attempting to create TagIndexManager2 (v2)")
+			// Prefer the new TagIndexManager2 implementation for engine2.
+			if tim2, err := indexer.NewTagIndexManager2(timOpts, deps, timLogger, timTracer); err == nil {
+				a.tagIndexManager = tim2
+				a.tagIndexImpl = "v2"
+				slog.Default().Info("Engine2Adapter: selected tag index impl", "impl", a.tagIndexImpl)
+			} else if tim, err := indexer.NewTagIndexManager(timOpts, deps, timLogger, timTracer); err == nil {
+				// Fallback to the legacy implementation if the v2 manager fails to initialize.
+				a.tagIndexManager = tim
+				a.tagIndexImpl = "legacy"
+				slog.Default().Info("Engine2Adapter: selected tag index impl", "impl", a.tagIndexImpl)
+			}
 		}
 	}
 
