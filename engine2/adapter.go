@@ -479,10 +479,17 @@ func (a *Engine2Adapter) Put(ctx context.Context, point core.DataPoint) error {
 
 		// Publish a realtime update for subscribers (best-effort)
 		if ps, _ := a.GetPubSub(); ps != nil {
+			var tagsCopy map[string]string
+			if point.Tags != nil {
+				tagsCopy = make(map[string]string, len(point.Tags))
+				for k, v := range point.Tags {
+					tagsCopy[k] = v
+				}
+			}
 			upd := &tsdb.DataPointUpdate{
 				UpdateType: tsdb.DataPointUpdate_PUT,
 				Metric:     point.Metric,
-				Tags:       point.Tags,
+				Tags:       tagsCopy,
 				Timestamp:  point.Timestamp,
 			}
 			ps.Publish(upd)
@@ -547,10 +554,17 @@ func (a *Engine2Adapter) Put(ctx context.Context, point core.DataPoint) error {
 
 		// Publish a realtime update for subscribers (best-effort)
 		if ps, _ := a.GetPubSub(); ps != nil {
+			var tagsCopy map[string]string
+			if point.Tags != nil {
+				tagsCopy = make(map[string]string, len(point.Tags))
+				for k, v := range point.Tags {
+					tagsCopy[k] = v
+				}
+			}
 			upd := &tsdb.DataPointUpdate{
 				UpdateType: tsdb.DataPointUpdate_PUT,
 				Metric:     point.Metric,
-				Tags:       point.Tags,
+				Tags:       tagsCopy,
 				Timestamp:  point.Timestamp,
 			}
 			ps.Publish(upd)
@@ -677,10 +691,17 @@ func (a *Engine2Adapter) PutBatch(ctx context.Context, points []core.DataPoint) 
 			// Publish the same minimal update used by single-Put so
 			// subscribers receive metric/tag/timestamp information and
 			// filters can match correctly.
+			var tagsCopy map[string]string
+			if points[i].Tags != nil {
+				tagsCopy = make(map[string]string, len(points[i].Tags))
+				for k, v := range points[i].Tags {
+					tagsCopy[k] = v
+				}
+			}
 			upd := &tsdb.DataPointUpdate{
 				UpdateType: tsdb.DataPointUpdate_PUT,
 				Metric:     points[i].Metric,
-				Tags:       points[i].Tags,
+				Tags:       tagsCopy,
 				Timestamp:  points[i].Timestamp,
 			}
 			ps.Publish(upd)
